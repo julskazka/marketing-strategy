@@ -131,7 +131,13 @@
     saveError = ""; displayStatus();
     try {
       await pending;
-      await call("finish", {answers: Engine.clean(answers)});
+      const snapshot = Engine.clean(answers);
+      for (let attempts = 0; attempts < 256; attempts++) {
+        const result = await call("finish", {answers: snapshot});
+        if (result.complete === true) break;
+        if (attempts === 255) throw new Error("Отправка заняла слишком много времени. Нажмите кнопку ещё раз.");
+        b.textContent = `Передаём ответы: ${result.confirmed || 0} из ${result.total || 1}`;
+      }
       saveError = "";
       go("result");
     } catch (error) {

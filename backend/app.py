@@ -25,7 +25,7 @@ def questionnaire():
         html = html.replace(notice, "")
     html = html.replace('<div class="preview-bar">', '<div class="preview-bar" hidden style="display:none">', 1)
     safe_config = json.dumps(cfg, ensure_ascii=True).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
-    injection = '<script>window.STRATEGY_CONFIG=' + safe_config + ';</script><script src="/assets/strategy-integration.js?v=2"></script>'
+    injection = '<script>window.STRATEGY_CONFIG=' + safe_config + ';</script><script src="/assets/strategy-integration.js?v=3"></script>'
     html = html.replace("</body>", injection + "</body>", 1)
     response = Response(html, mimetype="text/html")
     response.headers["Cache-Control"] = "no-cache, no-store"

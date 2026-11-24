@@ -292,7 +292,7 @@ def save_answers():
         serialized = json.dumps(a, ensure_ascii=False, sort_keys=True)
         if final and row["delivery"] == "finished" and row["answers"] == serialized:
             db.commit()
-            return jsonify(ok=True)
+            return jsonify(ok=True, complete=True)
         state = "finish_pending" if final else "started"
         if not final and row["answers"] == serialized and row["delivery"] == "finished":
             state = "finished"
@@ -315,7 +315,7 @@ def save_answers():
                 db.execute("UPDATE sessions SET delivery_parts=? WHERE token_hash=?",
                            (json.dumps(parts, ensure_ascii=False), key))
             index = row["delivery_index"]
-            while index < len(parts):
+            if index < len(parts):
                 try:
                     result = send(row, parts[index])
                     if str(result["deal_id"]) != row["deal_id"]:
@@ -326,16 +326,16 @@ def save_answers():
                         db.execute("UPDATE sessions SET delivery_parts=? WHERE token_hash=?",
                                    (json.dumps(parts, ensure_ascii=False), key))
                         db.commit()
-                        db.execute("BEGIN IMMEDIATE")
-                        continue
+                        return jsonify(ok=True, complete=False, confirmed=index, total=len(parts))
                     db.commit()
                     return error("Ответы сохранены. GetCourse пока не подтвердил отправку. Повторите попытку.", 502)
                 index += 1
                 db.execute("UPDATE sessions SET delivery_index=?,updated_at=? WHERE token_hash=?",
                            (index, now(), key))
-                db.commit()
                 if index < len(parts):
-                    db.execute("BEGIN IMMEDIATE")
+                    db.commit()
+                    return jsonify(ok=True, complete=False, confirmed=index, total=len(parts))
             db.execute("UPDATE sessions SET delivery='finished',updated_at=? WHERE token_hash=?", (now(), key))
             db.commit()
+            return jsonify(ok=True, complete=True)
         return jsonify(ok=True)

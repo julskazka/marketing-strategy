@@ -36,6 +36,13 @@ class IntegrationTests(unittest.TestCase):
     def post(self, method, **data):
         return self.client.post("/api/strategy/" + method, json=data)
 
+    def finish_all(self):
+        for _ in range(256):
+            response = self.post("finish", token=self.token, answers=self.answers)
+            if response.status_code != 200 or response.json.get("complete"):
+                return response
+        self.fail("Finish did not complete in 256 calls")
+
     @patch("backend.integration.upsert_order", return_value={"deal_id": 7})
     def test_same_order_and_readable_answers(self, send):
         self.assertEqual(self.post("start", **self.person).status_code, 200)
@@ -43,8 +50,13 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(send.call_count, 1)
         self.assertEqual(self.post("save", token=self.token, answers=self.answers).status_code, 200)
         self.assertEqual(self.post("resume", token=self.token).json["answers"], self.answers)
-        self.assertEqual(self.post("finish", token=self.token, answers=self.answers).status_code, 200)
-        self.assertEqual(self.post("finish", token=self.token, answers=self.answers).status_code, 200)
+        first = self.post("finish", token=self.token, answers=self.answers)
+        self.assertEqual(first.status_code, 200)
+        self.assertFalse(first.json["complete"])
+        self.assertEqual(first.json["confirmed"], 1)
+        self.assertEqual(send.call_count, 2)  # start and one finish part per request
+        self.assertTrue(self.finish_all().json["complete"])
+        self.assertTrue(self.finish_all().json["complete"])
         self.assertEqual(send.call_count, 1 + len(comment_parts(comment(self.answers))))
         self.assertTrue(all(c.args[1] == send.call_args_list[0].args[1]
                             for c in send.call_args_list))
@@ -82,7 +94,7 @@ class IntegrationTests(unittest.TestCase):
         send.side_effect = [GetCourseError("temporary")] + [{"deal_id":7}] * len(comment_parts(comment(self.answers)))
         self.assertEqual(self.post("finish", token=self.token, answers=self.answers).status_code, 502)
         self.assertEqual(self.post("resume", token=self.token).json["answers"], self.answers)
-        self.assertEqual(self.post("finish", token=self.token, answers=self.answers).status_code, 200)
+        self.assertTrue(self.finish_all().json["complete"])
         self.assertEqual(send.call_args_list[1].args[1], send.call_args_list[2].args[1])
 
     @patch("backend.integration.upsert_order", return_value={"deal_id":7})
@@ -95,10 +107,10 @@ class IntegrationTests(unittest.TestCase):
                 raise GetCourseError("COMMENT_VALIDATION")
             return {"deal_id":7}
         send.side_effect = bounded
-        self.assertEqual(self.post("finish", token=self.token, answers=self.answers).status_code, 200)
+        self.assertTrue(self.finish_all().json["complete"])
         accepted = [text for text in attempted if len(text) <= 100]
         self.assertEqual("".join(accepted), comment(self.answers))
-        self.assertEqual(self.post("finish", token=self.token, answers=self.answers).status_code, 200)
+        self.assertTrue(self.finish_all().json["complete"])
         self.assertEqual(len(attempted), len(send.call_args_list)-1)
 
     @patch("backend.integration.upsert_order", return_value={"deal_id":7})
@@ -112,8 +124,9 @@ class IntegrationTests(unittest.TestCase):
                 raise GetCourseError("NETWORK_ERROR")
             return {"deal_id":7}
         send.side_effect = interrupted
+        self.assertFalse(self.post("finish", token=self.token, answers=self.answers).json["complete"])
         self.assertEqual(self.post("finish", token=self.token, answers=self.answers).status_code, 502)
-        self.assertEqual(self.post("finish", token=self.token, answers=self.answers).status_code, 200)
+        self.assertTrue(self.finish_all().json["complete"])
         self.assertEqual(sent, [chunks[0], chunks[1], *chunks[1:]])
 
     @patch("backend.integration.upsert_order", return_value={"deal_id":7})
