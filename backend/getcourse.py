@@ -32,6 +32,8 @@ def rejection_code(body):
         return "ORDER_NUMBER"
     if "№ должен быть целым числом" in msg:
         return "ORDER_NUMBER"
+    if "deal_comment" in msg and ("валидац" in msg or "invalid" in msg):
+        return "COMMENT_VALIDATION"
     return "API_REJECTED"
 
 

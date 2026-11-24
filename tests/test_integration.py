@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 from backend.app import app
 from backend.getcourse import GetCourseError
-from backend.integration import comment, route, schema, database, digest, order_number
+from backend.integration import comment, comment_parts, route, schema, database, digest, order_number
 
 
 class IntegrationTests(unittest.TestCase):
@@ -45,10 +45,10 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(self.post("resume", token=self.token).json["answers"], self.answers)
         self.assertEqual(self.post("finish", token=self.token, answers=self.answers).status_code, 200)
         self.assertEqual(self.post("finish", token=self.token, answers=self.answers).status_code, 200)
-        self.assertEqual(send.call_count, 2)
-        self.assertEqual(send.call_args_list[0].args[1], send.call_args_list[1].args[1])
-        self.assertIn("Другая страна", send.call_args.args[2])
-        self.assertIn("Что ещё нужно учесть?", send.call_args.args[2])
+        self.assertEqual(send.call_count, 1 + len(comment_parts(comment(self.answers))))
+        self.assertTrue(all(c.args[1] == send.call_args_list[0].args[1]
+                            for c in send.call_args_list))
+        self.assertEqual("".join(c.args[2] for c in send.call_args_list[1:]), comment(self.answers))
 
     @patch("backend.integration.upsert_order")
     def test_start_retry(self, send):
@@ -79,11 +79,42 @@ class IntegrationTests(unittest.TestCase):
     @patch("backend.integration.upsert_order", return_value={"deal_id":7})
     def test_finish_retry(self, send):
         self.assertEqual(self.post("start", **self.person).status_code, 200)
-        send.side_effect = [GetCourseError("temporary"), {"deal_id":7}]
+        send.side_effect = [GetCourseError("temporary")] + [{"deal_id":7}] * len(comment_parts(comment(self.answers)))
         self.assertEqual(self.post("finish", token=self.token, answers=self.answers).status_code, 502)
         self.assertEqual(self.post("resume", token=self.token).json["answers"], self.answers)
         self.assertEqual(self.post("finish", token=self.token, answers=self.answers).status_code, 200)
         self.assertEqual(send.call_args_list[1].args[1], send.call_args_list[2].args[1])
+
+    @patch("backend.integration.upsert_order", return_value={"deal_id":7})
+    def test_comment_validation_splits_and_resumes_without_resending_confirmed_parts(self, send):
+        self.assertEqual(self.post("start", **self.person).status_code, 200)
+        attempted = []
+        def bounded(*args):
+            attempted.append(args[2])
+            if len(args[2]) > 100:
+                raise GetCourseError("COMMENT_VALIDATION")
+            return {"deal_id":7}
+        send.side_effect = bounded
+        self.assertEqual(self.post("finish", token=self.token, answers=self.answers).status_code, 200)
+        accepted = [text for text in attempted if len(text) <= 100]
+        self.assertEqual("".join(accepted), comment(self.answers))
+        self.assertEqual(self.post("finish", token=self.token, answers=self.answers).status_code, 200)
+        self.assertEqual(len(attempted), len(send.call_args_list)-1)
+
+    @patch("backend.integration.upsert_order", return_value={"deal_id":7})
+    def test_mid_delivery_retry_resumes_next_part(self, send):
+        self.assertEqual(self.post("start", **self.person).status_code, 200)
+        chunks = comment_parts(comment(self.answers))
+        sent = []
+        def interrupted(*args):
+            sent.append(args[2])
+            if len(sent) == 2:
+                raise GetCourseError("NETWORK_ERROR")
+            return {"deal_id":7}
+        send.side_effect = interrupted
+        self.assertEqual(self.post("finish", token=self.token, answers=self.answers).status_code, 502)
+        self.assertEqual(self.post("finish", token=self.token, answers=self.answers).status_code, 200)
+        self.assertEqual(sent, [chunks[0], chunks[1], *chunks[1:]])
 
     @patch("backend.integration.upsert_order", return_value={"deal_id":7})
     def test_consent_and_required_answers(self, send):

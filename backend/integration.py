@@ -47,6 +47,11 @@ def database():
             policy_url TEXT NOT NULL, answers TEXT NOT NULL DEFAULT '{}',
             deal_id TEXT, delivery TEXT NOT NULL DEFAULT 'start_pending',
             updated_at TEXT NOT NULL)""")
+        columns = {row[1] for row in db.execute("PRAGMA table_info(sessions)")}
+        if "delivery_parts" not in columns:
+            db.execute("ALTER TABLE sessions ADD COLUMN delivery_parts TEXT NOT NULL DEFAULT '[]'")
+        if "delivery_index" not in columns:
+            db.execute("ALTER TABLE sessions ADD COLUMN delivery_index INTEGER NOT NULL DEFAULT 0")
         db.commit()
         yield db
     finally:
@@ -174,6 +179,20 @@ def comment(a):
     return "\n".join(lines)
 
 
+def comment_parts(text, limit=300):
+    """Keep every character, including separators, in readable-sized comments."""
+    parts = []
+    while text:
+        if len(text) <= limit:
+            parts.append(text)
+            break
+        cut = max(text.rfind("\n", 1, limit + 1), text.rfind(" ", 1, limit + 1))
+        cut = cut + 1 if cut > limit // 2 else limit
+        parts.append(text[:cut])
+        text = text[cut:]
+    return parts
+
+
 def send(row, text):
     return upsert_order(row["email"], row["order_number"], text, row["name"], row["phone"])
 
@@ -277,8 +296,12 @@ def save_answers():
         state = "finish_pending" if final else "started"
         if not final and row["answers"] == serialized and row["delivery"] == "finished":
             state = "finished"
-        db.execute("UPDATE sessions SET answers=?,delivery=?,updated_at=? WHERE token_hash=?",
-                   (serialized, state, now(), key))
+        changed = row["answers"] != serialized
+        db.execute("""UPDATE sessions SET answers=?,delivery=?,updated_at=?,
+                    delivery_parts=CASE WHEN ? THEN '[]' ELSE delivery_parts END,
+                    delivery_index=CASE WHEN ? THEN 0 ELSE delivery_index END
+                    WHERE token_hash=?""",
+                   (serialized, state, now(), changed, changed, key))
         db.commit()
         if final:
             db.execute("BEGIN IMMEDIATE")
@@ -286,11 +309,33 @@ def save_answers():
             if row["answers"] != serialized:
                 db.rollback()
                 return error("Ответы изменились. Отправьте анкету ещё раз.", 409)
-            try:
-                send(row, comment(a))
-            except GetCourseError:
+            parts = json.loads(row["delivery_parts"])
+            if not parts:
+                parts = comment_parts(comment(a))
+                db.execute("UPDATE sessions SET delivery_parts=? WHERE token_hash=?",
+                           (json.dumps(parts, ensure_ascii=False), key))
+            index = row["delivery_index"]
+            while index < len(parts):
+                try:
+                    result = send(row, parts[index])
+                    if str(result["deal_id"]) != row["deal_id"]:
+                        raise GetCourseError("ORDER_ID_MISMATCH")
+                except GetCourseError as exc:
+                    if str(exc) == "COMMENT_VALIDATION" and len(parts[index]) > 1 and len(parts) < 128:
+                        parts[index:index+1] = comment_parts(parts[index], max(1, len(parts[index]) // 2))
+                        db.execute("UPDATE sessions SET delivery_parts=? WHERE token_hash=?",
+                                   (json.dumps(parts, ensure_ascii=False), key))
+                        db.commit()
+                        db.execute("BEGIN IMMEDIATE")
+                        continue
+                    db.commit()
+                    return error("Ответы сохранены. GetCourse пока не подтвердил отправку. Повторите попытку.", 502)
+                index += 1
+                db.execute("UPDATE sessions SET delivery_index=?,updated_at=? WHERE token_hash=?",
+                           (index, now(), key))
                 db.commit()
-                return error("Ответы сохранены. GetCourse пока не подтвердил отправку. Повторите попытку.", 502)
+                if index < len(parts):
+                    db.execute("BEGIN IMMEDIATE")
             db.execute("UPDATE sessions SET delivery='finished',updated_at=? WHERE token_hash=?", (now(), key))
             db.commit()
         return jsonify(ok=True)

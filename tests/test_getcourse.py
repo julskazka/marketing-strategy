@@ -54,3 +54,8 @@ class GetCourseTests(unittest.TestCase):
         with self.assertRaises(GetCourseError) as raised:
             upsert_order("test@example.invalid", "ms-invalid", "Анкета начата")
         self.assertEqual(str(raised.exception), "ORDER_NUMBER")
+
+    def test_comment_validation_code(self):
+        self.assertEqual(rejection_code({"success":True, "result":{
+            "success":False, "error_message":"Ошибка валидации: Проверьте значение поля deal_comment (длинный текст)"
+        }}), "COMMENT_VALIDATION")
