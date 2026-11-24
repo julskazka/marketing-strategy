@@ -1,10 +1,44 @@
-"""Server-only API adapter. No public endpoint calls it in the starter."""
+"""Server-only GetCourse API adapter with privacy-safe diagnostics."""
 import base64
 import json
+import logging
 import os
 import re
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+logger = logging.getLogger("gunicorn.error")
+
+
+def rejection_code(body):
+    result = body.get("result")
+    result = result if isinstance(result, dict) else {}
+    msg = " ".join(str(x) for x in (body.get("error"), body.get("error_message"),
+                                     result.get("error"), result.get("error_message"))).lower()
+    if any(x in msg for x in ("неавториз", "invalid key", "unauthoriz", "неверный ключ")):
+        return "AUTH_KEY"
+    if any(x in msg for x in ("действие запрещено", "forbidden", "access denied", "нет прав", "read only")):
+        return "WRITE_PERMISSION"
+    if "лимит" in msg or "limit" in msg:
+        return "API_LIMIT"
+    if ("предложен" in msg or "offer" in msg) and any(x in msg for x in ("не найден", "not found", "не существует", "invalid")):
+        return "OFFER_NOT_FOUND"
+    if any(x in msg for x in ("пустой параметр action", "не указаны параметры", "params", "base64")):
+        return "REQUEST_PARAMS"
+    if any(x in msg for x in ("эл. адрес", "email", "телефон", "phone")):
+        return "USER_PARAMS"
+    if any(x in msg for x in ("номер заказа", "deal_number", "order number")):
+        return "ORDER_NUMBER"
+    return "API_REJECTED"
+
+
+def fail(code, **details):
+    # Only fixed labels, integer status and boolean flags. Never log API keys,
+    # response bodies, client contacts, order numbers or questionnaire answers.
+    logger.warning("GETCOURSE_DIAG %s %s", code, details)
+    raise GetCourseError(code)
+
 
 class GetCourseError(RuntimeError):
     pass
@@ -27,11 +61,11 @@ def build_payload(email, order_number, offer_id, comment, first_name="", phone="
 def upsert_order(email, order_number, comment, first_name="", phone=""):
     if os.getenv("GETCOURSE_LIVE", "0") != "1":
         raise GetCourseError("Live integration disabled")
-    account = os.getenv("GETCOURSE_ACCOUNT", "")
-    key = os.getenv("GETCOURSE_API_KEY", "")
-    offer = os.getenv("GETCOURSE_OFFER_ID", "")
+    account = os.getenv("GETCOURSE_ACCOUNT", "").strip()
+    key = os.getenv("GETCOURSE_API_KEY", "").strip()
+    offer = os.getenv("GETCOURSE_OFFER_ID", "").strip()
     if not re.fullmatch(r"[a-zA-Z0-9-]+", account) or not key or not offer.isdigit():
-        raise GetCourseError("Integration configuration missing")
+        fail("CONFIG_MISSING")
     payload = build_payload(email, order_number, int(offer), comment, first_name, phone)
     encoded = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
     request = Request(
@@ -42,14 +76,35 @@ def upsert_order(email, order_number, comment, first_name="", phone=""):
     )
     try:
         with urlopen(request, timeout=15) as response:
+            status = response.status
             body = json.load(response)
-    except Exception:
-        raise GetCourseError("GetCourse request failed") from None
-    result = body.get("result", {}) if isinstance(body, dict) else {}
+    except HTTPError as exc:
+        try:
+            body = json.load(exc)
+        except (ValueError, UnicodeError, OSError):
+            body = {}
+        code = rejection_code(body) if isinstance(body, dict) else "API_REJECTED"
+        if code == "API_REJECTED":
+            code = "HTTP_" + str(exc.code)
+        fail(code, status=exc.code)
+    except URLError as exc:
+        fail("NETWORK_ERROR", reason_type=type(exc.reason).__name__)
+    except TimeoutError:
+        fail("TIMEOUT")
+    except (ValueError, UnicodeError):
+        fail("NON_JSON_RESPONSE")
+    except OSError:
+        fail("NETWORK_ERROR")
+    if not isinstance(body, dict):
+        fail("UNEXPECTED_RESPONSE")
+    result = body.get("result", {})
     def yes(value):
-        return value is True or value == 1 or value == "true" or value == "1"
+        return value is True or value == 1 or (isinstance(value, str) and value.lower() in ("true", "1"))
     if not isinstance(result, dict) or not yes(body.get("success")) or not yes(result.get("success")) or yes(result.get("error")):
-        raise GetCourseError("GetCourse rejected the request")
+        fail(rejection_code(body), status=status, top_success=yes(body.get("success")),
+             result_success=isinstance(result, dict) and yes(result.get("success")))
     if str(result.get("deal_number", "")) != str(order_number) or not result.get("deal_id"):
-        raise GetCourseError("Order confirmation incomplete")
+        fail("ORDER_CONFIRMATION_INCOMPLETE", has_id=bool(result.get("deal_id")),
+             has_number=bool(result.get("deal_number")), number_matches=str(result.get("deal_number", "")) == str(order_number))
+    logger.info("GETCOURSE_DIAG ORDER_CONFIRMED")
     return {"deal_id": result["deal_id"], "deal_number": result["deal_number"]}
