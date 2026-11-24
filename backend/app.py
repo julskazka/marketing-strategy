@@ -2,13 +2,14 @@ import json
 from pathlib import Path
 
 from flask import Flask, Response, jsonify
-from .integration import api, config
+from .integration import api, config, start_delivery_worker
 
 ROOT = Path(__file__).resolve().parent.parent
 
 app = Flask(__name__, static_folder=str(ROOT / "assets"), static_url_path="/assets")
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024
 app.register_blueprint(api)
+start_delivery_worker()
 
 
 @app.get("/")
@@ -25,7 +26,7 @@ def questionnaire():
         html = html.replace(notice, "")
     html = html.replace('<div class="preview-bar">', '<div class="preview-bar" hidden style="display:none">', 1)
     safe_config = json.dumps(cfg, ensure_ascii=True).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
-    injection = '<script>window.STRATEGY_CONFIG=' + safe_config + ';</script><script src="/assets/strategy-integration.js?v=3"></script>'
+    injection = '<script>window.STRATEGY_CONFIG=' + safe_config + ';</script><script src="/assets/strategy-integration.js?v=4"></script>'
     html = html.replace("</body>", injection + "</body>", 1)
     response = Response(html, mimetype="text/html")
     response.headers["Cache-Control"] = "no-cache, no-store"

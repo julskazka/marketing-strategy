@@ -5,6 +5,8 @@ import json
 import os
 import re
 import sqlite3
+import threading
+import logging
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +16,8 @@ from .getcourse import upsert_order, GetCourseError
 
 api = Blueprint("strategy_api", __name__, url_prefix="/api/strategy")
 ROOT = Path(__file__).resolve().parent.parent
+logger = logging.getLogger("gunicorn.error")
+delivery_wakeup = threading.Event()
 
 
 CONSENT_URL = "https://loonsisters.getcourse.ru/privacy"
@@ -52,6 +56,10 @@ def database():
             db.execute("ALTER TABLE sessions ADD COLUMN delivery_parts TEXT NOT NULL DEFAULT '[]'")
         if "delivery_index" not in columns:
             db.execute("ALTER TABLE sessions ADD COLUMN delivery_index INTEGER NOT NULL DEFAULT 0")
+        if "delivery_rejections" not in columns:
+            db.execute("ALTER TABLE sessions ADD COLUMN delivery_rejections INTEGER NOT NULL DEFAULT 0")
+        if "delivery_error" not in columns:
+            db.execute("ALTER TABLE sessions ADD COLUMN delivery_error TEXT NOT NULL DEFAULT ''")
         db.commit()
         yield db
     finally:
@@ -197,6 +205,70 @@ def send(row, text):
     return upsert_order(row["email"], row["order_number"], text, row["name"], row["phone"])
 
 
+def deliver_pending_once():
+    """Send at most one comment; the cursor in /data survives worker restarts."""
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT * FROM sessions WHERE delivery='finish_pending' ORDER BY updated_at LIMIT 1").fetchone()
+        if not row:
+            db.commit()
+            return False
+        key = row["token_hash"]
+        parts = json.loads(row["delivery_parts"])
+        if not parts:
+            parts = comment_parts(comment(json.loads(row["answers"])))
+            db.execute("UPDATE sessions SET delivery_parts=? WHERE token_hash=?",
+                       (json.dumps(parts, ensure_ascii=False), key))
+        index = row["delivery_index"]
+        if index >= len(parts):
+            db.execute("UPDATE sessions SET delivery='finished',delivery_error='',updated_at=? WHERE token_hash=?", (now(), key))
+            db.commit()
+            return True
+        try:
+            result = send(row, parts[index])
+            if str(result["deal_id"]) != row["deal_id"]:
+                raise GetCourseError("ORDER_ID_MISMATCH")
+        except GetCourseError as exc:
+            code = str(exc)
+            failures = row["delivery_rejections"] + 1
+            if code == "COMMENT_VALIDATION" and len(parts[index].strip()) > 1 and failures < 5 and len(parts) < 128:
+                chunks = comment_parts(parts[index], max(1, len(parts[index]) // 2))
+                if all(chunk.strip() for chunk in chunks):
+                    parts[index:index+1] = chunks
+                    db.execute("UPDATE sessions SET delivery_parts=?,delivery_rejections=?,updated_at=? WHERE token_hash=?",
+                               (json.dumps(parts, ensure_ascii=False), failures, now(), key))
+                    db.commit()
+                    return True
+            state = "delivery_failed" if code == "COMMENT_VALIDATION" or failures >= 3 else "finish_pending"
+            if state == "delivery_failed":
+                logger.warning("STRATEGY_DELIVERY stopped code=%s part=%d chars=%d", code, index + 1, len(parts[index]))
+            db.execute("UPDATE sessions SET delivery=?,delivery_rejections=?,delivery_error=?,updated_at=? WHERE token_hash=?",
+                       (state, failures, code, now(), key))
+            db.commit()
+            return False
+        index += 1
+        state = "finished" if index == len(parts) else "finish_pending"
+        db.execute("UPDATE sessions SET delivery=?,delivery_index=?,delivery_rejections=0,delivery_error='',updated_at=? WHERE token_hash=?",
+                   (state, index, now(), key))
+        db.commit()
+        return True
+
+
+def start_delivery_worker():
+    if not config()["enabled"]:
+        return
+    def loop():
+        while True:
+            try:
+                if deliver_pending_once():
+                    continue
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                logger.warning("STRATEGY_DELIVERY worker_error=%s", type(exc).__name__)
+            delivery_wakeup.wait(10)
+            delivery_wakeup.clear()
+    threading.Thread(target=loop, name="strategy-delivery", daemon=True).start()
+
+
 @api.get("/config")
 def get_config():
     return jsonify(config())
@@ -271,6 +343,19 @@ def resume():
         return jsonify(ok=True, answers=json.loads(row["answers"]), person={k:row[k] for k in ("name","email","phone")})
 
 
+@api.post("/delivery")
+def delivery_status():
+    try:
+        key = digest(payload() or {})
+    except ValueError as exc:
+        return error(str(exc))
+    with database() as db:
+        row = db.execute("SELECT delivery FROM sessions WHERE token_hash=? AND deal_id IS NOT NULL", (key,)).fetchone()
+        if not row:
+            return error("Анкета не найдена.", 404)
+        return jsonify(ok=True, delivery=row["delivery"])
+
+
 @api.post("/save")
 @api.post("/finish")
 def save_answers():
@@ -299,43 +384,13 @@ def save_answers():
         changed = row["answers"] != serialized
         db.execute("""UPDATE sessions SET answers=?,delivery=?,updated_at=?,
                     delivery_parts=CASE WHEN ? THEN '[]' ELSE delivery_parts END,
-                    delivery_index=CASE WHEN ? THEN 0 ELSE delivery_index END
+                    delivery_index=CASE WHEN ? THEN 0 ELSE delivery_index END,
+                    delivery_rejections=CASE WHEN ? THEN 0 ELSE delivery_rejections END,
+                    delivery_error=CASE WHEN ? THEN '' ELSE delivery_error END
                     WHERE token_hash=?""",
-                   (serialized, state, now(), changed, changed, key))
+                   (serialized, state, now(), changed, changed, changed, changed, key))
         db.commit()
         if final:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM sessions WHERE token_hash=?", (key,)).fetchone()
-            if row["answers"] != serialized:
-                db.rollback()
-                return error("Ответы изменились. Отправьте анкету ещё раз.", 409)
-            parts = json.loads(row["delivery_parts"])
-            if not parts:
-                parts = comment_parts(comment(a))
-                db.execute("UPDATE sessions SET delivery_parts=? WHERE token_hash=?",
-                           (json.dumps(parts, ensure_ascii=False), key))
-            index = row["delivery_index"]
-            if index < len(parts):
-                try:
-                    result = send(row, parts[index])
-                    if str(result["deal_id"]) != row["deal_id"]:
-                        raise GetCourseError("ORDER_ID_MISMATCH")
-                except GetCourseError as exc:
-                    if str(exc) == "COMMENT_VALIDATION" and len(parts[index]) > 1 and len(parts) < 128:
-                        parts[index:index+1] = comment_parts(parts[index], max(1, len(parts[index]) // 2))
-                        db.execute("UPDATE sessions SET delivery_parts=? WHERE token_hash=?",
-                                   (json.dumps(parts, ensure_ascii=False), key))
-                        db.commit()
-                        return jsonify(ok=True, complete=False, confirmed=index, total=len(parts))
-                    db.commit()
-                    return error("Ответы сохранены. GetCourse пока не подтвердил отправку. Повторите попытку.", 502)
-                index += 1
-                db.execute("UPDATE sessions SET delivery_index=?,updated_at=? WHERE token_hash=?",
-                           (index, now(), key))
-                if index < len(parts):
-                    db.commit()
-                    return jsonify(ok=True, complete=False, confirmed=index, total=len(parts))
-            db.execute("UPDATE sessions SET delivery='finished',updated_at=? WHERE token_hash=?", (now(), key))
-            db.commit()
-            return jsonify(ok=True, complete=True)
+            delivery_wakeup.set()
+            return jsonify(ok=True, queued=True)
         return jsonify(ok=True)

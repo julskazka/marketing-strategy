@@ -33,7 +33,7 @@
     return data;
   }
   function displayStatus() {
-    if (!["question","review"].includes(screen)) return;
+    if (!["question","review","result"].includes(screen)) return;
     let status = document.getElementById("strategy-status");
     if (!status) {
       status = document.createElement("p");
@@ -41,7 +41,7 @@
       status.className = "muted";
       status.setAttribute("role", "status");
       status.style.fontSize = "14px";
-      const anchor = app.querySelector(".actions") || app.querySelector(".form-card");
+      const anchor = app.querySelector(".actions") || app.querySelector(".form-card") || app;
       if (anchor) anchor.append(status);
     }
     if (status) status.textContent = saveError;
@@ -98,6 +98,22 @@
     editing = false;
     go("question");
   }
+  async function watchDelivery() {
+    if (screen !== "result") return;
+    try {
+      const data = await call("delivery");
+      if (data.delivery === "finished") {
+        saveError = "Ответы переданы в GetCourse.";
+      } else if (data.delivery === "delivery_failed") {
+        saveError = "План готов, ответы сохранены. Передачу в GetCourse нужно проверить.";
+      } else {
+        saveError = "План готов, ответы сохранены. Передаём их в GetCourse.";
+      }
+      displayStatus();
+      if (data.delivery === "finished" || data.delivery === "delivery_failed") return;
+    } catch { /* The plan is available even when the status request fails. */ }
+    setTimeout(watchDelivery, 5000);
+  }
   app.addEventListener("submit", async e => {
     if (e.target.id !== "contact-form") return;
     e.preventDefault(); e.stopImmediatePropagation();
@@ -131,15 +147,10 @@
     saveError = ""; displayStatus();
     try {
       await pending;
-      const snapshot = Engine.clean(answers);
-      for (let attempts = 0; attempts < 256; attempts++) {
-        const result = await call("finish", {answers: snapshot});
-        if (result.complete === true) break;
-        if (attempts === 255) throw new Error("Отправка заняла слишком много времени. Нажмите кнопку ещё раз.");
-        b.textContent = `Передаём ответы: ${result.confirmed || 0} из ${result.total || 1}`;
-      }
-      saveError = "";
+      await call("finish", {answers: Engine.clean(answers)});
+      saveError = "План готов, ответы сохранены. Передаём их в GetCourse.";
       go("result");
+      watchDelivery();
     } catch (error) {
       saveError = error.message || "Не удалось подтвердить отправку. Попробуйте ещё раз.";
       displayStatus();
