@@ -16,7 +16,7 @@ api = Blueprint("strategy_api", __name__, url_prefix="/api/strategy")
 ROOT = Path(__file__).resolve().parent.parent
 
 
-CONSENT_URL = "https://loonsisters.getcourse.ru/pl/cms/page?part=content&mode=page&id=3204850"
+CONSENT_URL = "https://loonsisters.getcourse.ru/privacy"
 
 
 def config():
