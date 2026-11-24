@@ -8,7 +8,6 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from flask import Blueprint, jsonify, request
 from .getcourse import upsert_order, GetCourseError
@@ -17,19 +16,15 @@ api = Blueprint("strategy_api", __name__, url_prefix="/api/strategy")
 ROOT = Path(__file__).resolve().parent.parent
 
 
+CONSENT_URL = "https://loonsisters.getcourse.ru/pl/cms/page?part=content&mode=page&id=3204850"
+
+
 def config():
-    consent = os.getenv("GETCOURSE_CONSENT_URL", "")
-    policy = os.getenv("GETCOURSE_POLICY_URL", "")
-    def valid_url(value):
-        u = urlsplit(value)
-        return u.scheme == "https" and bool(u.netloc)
     enabled = (os.getenv("GETCOURSE_LIVE") == "1"
                and bool(re.fullmatch(r"[A-Za-z0-9-]+", os.getenv("GETCOURSE_ACCOUNT", "")))
                and os.getenv("GETCOURSE_OFFER_ID", "").isdigit()
-               and bool(os.getenv("GETCOURSE_API_KEY"))
-               and valid_url(consent) and valid_url(policy))
-    return {"enabled": bool(enabled), "consent_url": consent if enabled else "",
-            "policy_url": policy if enabled else ""}
+               and bool(os.getenv("GETCOURSE_API_KEY")))
+    return {"enabled": bool(enabled), "consent_url": CONSENT_URL, "policy_url": ""}
 
 
 def now():
