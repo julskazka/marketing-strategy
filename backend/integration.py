@@ -67,6 +67,11 @@ def digest(data):
     return hashlib.sha256(token.encode("ascii")).hexdigest()
 
 
+def order_number(token_hash):
+    """Stable numeric GetCourse deal number for one questionnaire session."""
+    return str(800_000_000_000 + int(token_hash[:10], 16) % 100_000_000_000)
+
+
 def error(message, status=400):
     return jsonify(ok=False, message=message), status
 
@@ -205,8 +210,14 @@ def start():
         db.execute("""INSERT OR IGNORE INTO sessions
             (token_hash,order_number,name,email,phone,consent_at,consent_url,policy_url,updated_at)
             VALUES (?,?,?,?,?,?,?,?,?)""",
-            (key, "ms-" + key[:32], name, email, phone, now(), cfg["consent_url"], cfg["policy_url"], now()))
+            (key, order_number(key), name, email, phone, now(), cfg["consent_url"], cfg["policy_url"], now()))
         row = db.execute("SELECT * FROM sessions WHERE token_hash=?", (key,)).fetchone()
+        # Earlier versions stored an alphanumeric number rejected by GetCourse.
+        # Migrate only sessions without a confirmed deal, preserving established IDs.
+        if not row["deal_id"] and not row["order_number"].isdigit():
+            db.execute("UPDATE sessions SET order_number=? WHERE token_hash=?",
+                       (order_number(key), key))
+            row = db.execute("SELECT * FROM sessions WHERE token_hash=?", (key,)).fetchone()
         db.commit()
         if row["email"] != email:
             return error("Эта анкета уже привязана к другой почте.", 409)

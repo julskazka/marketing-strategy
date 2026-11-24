@@ -30,6 +30,8 @@ def rejection_code(body):
         return "USER_PARAMS"
     if any(x in msg for x in ("номер заказа", "deal_number", "order number")):
         return "ORDER_NUMBER"
+    if "№ должен быть целым числом" in msg:
+        return "ORDER_NUMBER"
     return "API_REJECTED"
 
 

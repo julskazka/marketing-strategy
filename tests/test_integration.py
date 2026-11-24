@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 from backend.app import app
 from backend.getcourse import GetCourseError
-from backend.integration import comment, route, schema
+from backend.integration import comment, route, schema, database, digest, order_number
 
 
 class IntegrationTests(unittest.TestCase):
@@ -56,6 +56,25 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(self.post("start", **self.person).status_code, 502)
         self.assertEqual(self.post("start", **self.person).status_code, 200)
         self.assertEqual(send.call_args_list[0].args[1], send.call_args_list[1].args[1])
+        self.assertTrue(send.call_args_list[0].args[1].isdigit())
+
+    @patch("backend.integration.upsert_order", return_value={"deal_id":7})
+    def test_old_pending_session_migrates_without_new_order(self, send):
+        key = digest(self.person)
+        with database() as db:
+            db.execute("""INSERT INTO sessions
+                (token_hash,order_number,name,email,phone,consent_at,consent_url,policy_url,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?)""", (key, "ms-" + key[:32], "Тест",
+                "test@example.invalid", "+7 999 000-00-00", "now", "https://loonsisters.getcourse.ru/privacy", "", "now"))
+            db.commit()
+        self.assertEqual(self.post("start", **self.person).status_code, 200)
+        self.assertEqual(self.post("start", **self.person).status_code, 200)
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_args.args[1], order_number(key))
+        with database() as db:
+            row = db.execute("SELECT order_number,deal_id FROM sessions WHERE token_hash=?", (key,)).fetchone()
+            self.assertEqual(row["order_number"], order_number(key))
+            self.assertEqual(row["deal_id"], "7")
 
     @patch("backend.integration.upsert_order", return_value={"deal_id":7})
     def test_finish_retry(self, send):
