@@ -33,9 +33,31 @@ def rejection_code(body):
     return "API_REJECTED"
 
 
+def safe_error_message(body, secrets):
+    """Diagnostic message only; redact submitted values and credentials."""
+    result = body.get("result")
+    result = result if isinstance(result, dict) else {}
+    parts = []
+    for obj in (result, body):
+        for field in ("error_message", "message", "error", "errors"):
+            val = obj.get(field)
+            if isinstance(val, str) and val.lower() not in ("true", "false", "0", "1"):
+                parts.append(val)
+            elif isinstance(val, (list, dict)):
+                parts.append(json.dumps(val, ensure_ascii=False))
+    msg = " | ".join(parts)[:4000]
+    for secret in sorted((str(x) for x in secrets if x), key=len, reverse=True):
+        msg = re.sub(re.escape(secret), "[redacted]", msg, flags=re.IGNORECASE)
+    msg = re.sub(r"https?://[^\s<>'\"]+", "[url]", msg)
+    msg = re.sub(r"[^\s<>@]+@[^\s<>@]+", "[email]", msg)
+    msg = re.sub(r"(?<!\w)\+?\d[\d\s().-]{7,}\d", "[number]", msg)
+    msg = re.sub(r"[A-Za-z0-9_+/=-]{20,}", "[token]", msg)
+    msg = re.sub(r"<[^>]*>", "", msg)
+    return " ".join(msg.split())[:350] or "(no error message)"
+
+
 def fail(code, **details):
-    # Only fixed labels, integer status and boolean flags. Never log API keys,
-    # response bodies, client contacts, order numbers or questionnaire answers.
+    # Fixed codes and redacted diagnostic messages only; never log entire bodies.
     logger.warning("GETCOURSE_DIAG %s %s", code, details)
     raise GetCourseError(code)
 
@@ -68,6 +90,7 @@ def upsert_order(email, order_number, comment, first_name="", phone=""):
         fail("CONFIG_MISSING")
     payload = build_payload(email, order_number, int(offer), comment, first_name, phone)
     encoded = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
+    secrets = (key, email, first_name, phone, re.sub(r"\D", "", phone), order_number, comment, encoded)
     request = Request(
         "https://" + account + ".getcourse.ru/pl/api/deals",
         data=urlencode({"action": "add", "key": key, "params": encoded}).encode("ascii"),
@@ -86,7 +109,7 @@ def upsert_order(email, order_number, comment, first_name="", phone=""):
         code = rejection_code(body) if isinstance(body, dict) else "API_REJECTED"
         if code == "API_REJECTED":
             code = "HTTP_" + str(exc.code)
-        fail(code, status=exc.code)
+        fail(code, status=exc.code, detail=safe_error_message(body, secrets) if isinstance(body, dict) else "(no error message)")
     except URLError as exc:
         fail("NETWORK_ERROR", reason_type=type(exc.reason).__name__)
     except TimeoutError:
@@ -102,7 +125,8 @@ def upsert_order(email, order_number, comment, first_name="", phone=""):
         return value is True or value == 1 or (isinstance(value, str) and value.lower() in ("true", "1"))
     if not isinstance(result, dict) or not yes(body.get("success")) or not yes(result.get("success")) or yes(result.get("error")):
         fail(rejection_code(body), status=status, top_success=yes(body.get("success")),
-             result_success=isinstance(result, dict) and yes(result.get("success")))
+             result_success=isinstance(result, dict) and yes(result.get("success")),
+             detail=safe_error_message(body, secrets))
     if str(result.get("deal_number", "")) != str(order_number) or not result.get("deal_id"):
         fail("ORDER_CONFIRMATION_INCOMPLETE", has_id=bool(result.get("deal_id")),
              has_number=bool(result.get("deal_number")), number_matches=str(result.get("deal_number", "")) == str(order_number))
