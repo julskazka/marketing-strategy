@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 from backend.app import app
 from backend.getcourse import GetCourseError
-from backend.integration import comment, route, schema, database, digest, order_number, deliver_pending_once
+from backend.integration import comment, route, schema, database, digest, order_number, deliver_pending_once, backup_pending_once
 
 
 class IntegrationTests(unittest.TestCase):
@@ -90,6 +90,26 @@ class IntegrationTests(unittest.TestCase):
         with patch.dict(os.environ, {"GETCOURSE_DEVELOPER_KEY":"dev"}), patch("backend.integration.add_full_order_comment") as add:
             self.assertTrue(deliver_pending_once())
             add.assert_called_once_with("7", comment(self.answers))
+
+    @patch("backend.integration.upsert_order", return_value={"deal_id":7})
+    def test_sheet_backup_upserts_same_order_and_preserves_saved_answers(self, send):
+        self.post("start", **self.person)
+        self.post("finish", token=self.token, answers=self.answers)
+        with patch.dict(os.environ, {"GOOGLE_SHEETS_WEBHOOK_URL":"https://script.google.com/macros/s/test/exec",
+                                  "GOOGLE_SHEETS_WEBHOOK_SECRET":"fake"}), patch("backend.integration.send_backup") as backup:
+            self.assertTrue(backup_pending_once())
+            self.assertFalse(backup_pending_once())
+            self.assertEqual(backup.call_count, 1)
+            row, answers, status = backup.call_args.args
+            self.assertEqual(row["order_number"], order_number(digest(self.person)))
+            self.assertIn("Анкета заполнена", answers)
+            self.assertIn("Ожидает", status)
+            self.assertEqual(self.post("resume", token=self.token).json["answers"], self.answers)
+            self.post("finish", token=self.token, answers=self.answers)
+            self.assertTrue(backup_pending_once())
+            self.assertEqual(backup.call_count, 2)
+            self.assertEqual(backup.call_args.args[0]["order_number"], row["order_number"])
+        self.assertEqual(send.call_count, 1)
 
     @patch("backend.integration.upsert_order", return_value={"deal_id":7})
     def test_v2_failure_stops_retries_without_losing_answers(self, send):

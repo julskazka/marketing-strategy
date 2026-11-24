@@ -8,11 +8,12 @@ import sqlite3
 import threading
 import logging
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from flask import Blueprint, jsonify, request
 from .getcourse import upsert_order, add_full_order_comment, v2_configured, GetCourseError
+from .sheets_backup import send_backup, configured as sheets_configured, SheetsError
 
 api = Blueprint("strategy_api", __name__, url_prefix="/api/strategy")
 ROOT = Path(__file__).resolve().parent.parent
@@ -60,6 +61,10 @@ def database():
             db.execute("ALTER TABLE sessions ADD COLUMN delivery_rejections INTEGER NOT NULL DEFAULT 0")
         if "delivery_error" not in columns:
             db.execute("ALTER TABLE sessions ADD COLUMN delivery_error TEXT NOT NULL DEFAULT ''")
+        if "sheet_delivery" not in columns:
+            db.execute("ALTER TABLE sessions ADD COLUMN sheet_delivery TEXT NOT NULL DEFAULT 'pending'")
+        if "sheet_retry_at" not in columns:
+            db.execute("ALTER TABLE sessions ADD COLUMN sheet_retry_at TEXT NOT NULL DEFAULT ''")
         db.commit()
         yield db
     finally:
@@ -208,32 +213,60 @@ def send(row, text):
 def deliver_pending_once():
     """Deliver a complete note to the existing deal without touching its status or positions."""
     with database() as db:
-        db.execute("BEGIN IMMEDIATE")
         row = db.execute("""SELECT * FROM sessions WHERE delivery='finish_pending'
             OR (delivery='delivery_failed' AND delivery_error IN ('COMMENT_VALIDATION','V2_NOT_CONFIGURED'))
             ORDER BY updated_at LIMIT 1""").fetchone()
         if not row:
             db.commit()
             return False
-        key = row["token_hash"]
         if not v2_configured():
             db.execute("UPDATE sessions SET delivery='delivery_failed',delivery_error='V2_NOT_CONFIGURED',updated_at=? WHERE token_hash=?",
-                       (now(), key))
+                       (now(), row["token_hash"]))
             db.commit()
             return False
-        try:
-            add_full_order_comment(row["deal_id"], comment(json.loads(row["answers"])))
-        except GetCourseError as exc:
-            code = str(exc)
-            logger.warning("STRATEGY_DELIVERY stopped code=%s", code)
-            db.execute("UPDATE sessions SET delivery='delivery_failed',delivery_error=?,updated_at=? WHERE token_hash=?",
-                       (code, now(), key))
+    try:
+        add_full_order_comment(row["deal_id"], comment(json.loads(row["answers"])))
+    except GetCourseError as exc:
+        code = str(exc)
+        logger.warning("STRATEGY_DELIVERY stopped code=%s", code)
+        with database() as db:
+            db.execute("UPDATE sessions SET delivery='delivery_failed',delivery_error=? WHERE token_hash=? AND answers=? AND delivery='finish_pending'",
+                       (code, row["token_hash"], row["answers"]))
             db.commit()
-            return False
-        db.execute("UPDATE sessions SET delivery='finished',delivery_error='',updated_at=? WHERE token_hash=?",
-                   (now(), key))
+        return False
+    with database() as db:
+        db.execute("UPDATE sessions SET delivery='finished',delivery_error='',sheet_delivery='pending' WHERE token_hash=? AND answers=? AND delivery IN ('finish_pending','delivery_failed')",
+                   (row["token_hash"], row["answers"]))
         db.commit()
         return True
+
+
+def backup_pending_once():
+    if not sheets_configured():
+        return False
+    with database() as db:
+        row = db.execute("""SELECT * FROM sessions WHERE deal_id IS NOT NULL
+            AND delivery IN ('finish_pending','delivery_failed','finished')
+            AND sheet_delivery='pending' AND sheet_retry_at<=?
+            ORDER BY updated_at LIMIT 1""", (now(),)).fetchone()
+        if not row:
+            return False
+    status = "Получено" if row["delivery"] == "finished" else "Ожидает подтверждения"
+    try:
+        send_backup(row, comment(json.loads(row["answers"])), status)
+    except SheetsError as exc:
+        logger.warning("STRATEGY_BACKUP code=%s", str(exc))
+        with database() as db:
+            db.execute("UPDATE sessions SET sheet_retry_at=? WHERE token_hash=? AND answers=? AND sheet_delivery='pending'",
+                       ((datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(), row["token_hash"], row["answers"]))
+            db.commit()
+        return False
+    with database() as db:
+        db.execute("UPDATE sessions SET sheet_delivery='saved',sheet_retry_at='' WHERE token_hash=? AND answers=? AND sheet_delivery='pending'",
+                   (row["token_hash"], row["answers"]))
+        db.commit()
+    logger.info("STRATEGY_BACKUP confirmed")
+    return True
 
 
 def start_delivery_worker():
@@ -242,6 +275,8 @@ def start_delivery_worker():
     def loop():
         while True:
             try:
+                if backup_pending_once():
+                    continue
                 if deliver_pending_once():
                     continue
             except (OSError, sqlite3.Error, ValueError) as exc:
@@ -365,12 +400,15 @@ def save_answers():
             state = "finished"
         changed = row["answers"] != serialized
         db.execute("""UPDATE sessions SET answers=?,delivery=?,updated_at=?,
+                    sheet_delivery=CASE WHEN ? THEN 'pending' ELSE sheet_delivery END,
+                    sheet_retry_at=CASE WHEN ? THEN '' ELSE sheet_retry_at END,
                     delivery_parts=CASE WHEN ? THEN '[]' ELSE delivery_parts END,
                     delivery_index=CASE WHEN ? THEN 0 ELSE delivery_index END,
                     delivery_rejections=CASE WHEN ? THEN 0 ELSE delivery_rejections END,
                     delivery_error=CASE WHEN ? THEN '' ELSE delivery_error END
                     WHERE token_hash=?""",
-                   (serialized, state, now(), changed, changed, changed, changed, key))
+                   (serialized, state, now(), final or changed, final or changed,
+                    changed, changed, changed, changed, key))
         db.commit()
         if final:
             delivery_wakeup.set()
