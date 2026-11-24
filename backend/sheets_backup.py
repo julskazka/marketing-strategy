@@ -38,5 +38,11 @@ def send_backup(row, readable_answers, getcourse_status):
         raise SheetsError("NETWORK") from None
     except (ValueError, UnicodeError):
         raise SheetsError("RESPONSE") from None
-    if not isinstance(result, dict) or result.get("ok") is not True or str(result.get("order_number")) != row["order_number"]:
+    if isinstance(result, dict) and result.get("ok") is False:
+        code = result.get("code")
+        if isinstance(code, str) and code in {"CONFIGURATION", "REQUEST", "SIGNATURE", "PAYLOAD", "LOCK", "SHEET_OPEN", "SHEET_MISSING", "SHEET_WRITE"}:
+            raise SheetsError("GOOGLE_" + code)
+    if not isinstance(result, dict) or result.get("ok") is not True:
         raise SheetsError("UNCONFIRMED")
+    if str(result.get("order_number")) != str(row["order_number"]):
+        raise SheetsError("ORDER_MISMATCH")
