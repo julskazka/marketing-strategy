@@ -5,7 +5,7 @@ import base64
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs
-from backend.getcourse import build_payload, upsert_order, GetCourseError, rejection_code
+from backend.getcourse import build_payload, upsert_order, add_full_order_comment, GetCourseError, rejection_code
 
 class GetCourseTests(unittest.TestCase):
     def test_same_order_number(self):
@@ -59,3 +59,30 @@ class GetCourseTests(unittest.TestCase):
         self.assertEqual(rejection_code({"success":True, "result":{
             "success":False, "error_message":"Ошибка валидации: Проверьте значение поля deal_comment (длинный текст)"
         }}), "COMMENT_VALIDATION")
+
+    @patch.dict(os.environ, {"GETCOURSE_ACCOUNT":"loonsisters", "GETCOURSE_DEVELOPER_KEY":"developer",
+                          "GETCOURSE_API_KEY":"school"})
+    @patch("backend.getcourse.urlopen")
+    def test_v2_adds_full_comment_to_existing_deal_only(self, urlopen):
+        class Response(io.BytesIO):
+            status = 200
+        urlopen.side_effect = [Response(json.dumps({"status":True,"data":{"id":42,"user_id":11}}).encode()),
+                               Response(json.dumps({"status":True,"data":{"result":True}}).encode())]
+        add_full_order_comment("42", "Все вопросы и ответы\nНа русском языке")
+        self.assertEqual(urlopen.call_count, 2)
+        request = urlopen.call_args.args[0]
+        self.assertIn("/pl/api/v1/deal/add-comment", request.full_url)
+        self.assertEqual(request.get_header("Authorization"), "Bearer developer_school")
+        self.assertEqual(json.loads(request.data), {"dealId":42, "userId":11,
+                          "text":"Все вопросы и ответы\nНа русском языке"})
+
+    @patch.dict(os.environ, {"GETCOURSE_ACCOUNT":"loonsisters", "GETCOURSE_DEVELOPER_KEY":"developer",
+                          "GETCOURSE_API_KEY":"school"})
+    @patch("backend.getcourse.urlopen")
+    def test_v2_refuses_mismatched_order(self, urlopen):
+        urlopen.return_value.__enter__.return_value = io.BytesIO(json.dumps({
+            "status":True, "data":{"id":43,"user_id":11}
+        }).encode())
+        with self.assertRaises(GetCourseError):
+            add_full_order_comment("42", "Анкета")
+        self.assertEqual(urlopen.call_count, 1)

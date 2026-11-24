@@ -69,6 +69,56 @@ def fail(code, **details):
 class GetCourseError(RuntimeError):
     pass
 
+
+def v2_configured():
+    return bool(os.getenv("GETCOURSE_DEVELOPER_KEY", "").strip())
+
+
+def v2_request(path, method="GET", params=None, payload=None):
+    """Official GetCourse API v2: developer key + school key, server side only."""
+    account = os.getenv("GETCOURSE_ACCOUNT", "").strip()
+    developer = os.getenv("GETCOURSE_DEVELOPER_KEY", "").strip()
+    school = os.getenv("GETCOURSE_V2_SCHOOL_KEY", "").strip() or os.getenv("GETCOURSE_API_KEY", "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9-]+", account) or not developer or not school:
+        raise GetCourseError("V2_NOT_CONFIGURED")
+    url = "https://" + account + ".getcourse.ru/pl/api/v1" + path
+    if params:
+        url += "?" + urlencode(params)
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    req = Request(url, data=data, method=method, headers={
+        "Authorization": "Bearer " + developer + "_" + school,
+        "Accept": "application/json", "Content-Type": "application/json",
+    })
+    try:
+        with urlopen(req, timeout=15) as response:
+            body = json.load(response)
+    except HTTPError as exc:
+        logger.warning("GETCOURSE_V2 HTTP_%d", exc.code)
+        raise GetCourseError("V2_HTTP_" + str(exc.code)) from None
+    except (URLError, TimeoutError, OSError):
+        raise GetCourseError("V2_NETWORK") from None
+    except (ValueError, UnicodeError):
+        raise GetCourseError("V2_RESPONSE") from None
+    if not isinstance(body, dict) or body.get("status") is not True or body.get("errors"):
+        logger.warning("GETCOURSE_V2 REJECTED")
+        raise GetCourseError("V2_REJECTED")
+    return body.get("data")
+
+
+def add_full_order_comment(deal_id, text):
+    """Append the whole readable questionnaire to an existing deal, without editing it."""
+    if not str(deal_id).isdigit():
+        raise GetCourseError("V2_DEAL_ID")
+    deal_id = int(deal_id)
+    deal = v2_request("/deal/get-fields", params={"dealId": deal_id})
+    if not isinstance(deal, dict) or deal.get("id") != deal_id or not isinstance(deal.get("user_id"), int):
+        raise GetCourseError("V2_DEAL_LOOKUP")
+    result = v2_request("/deal/add-comment", method="POST", payload={
+        "dealId": deal_id, "userId": deal["user_id"], "text": text,
+    })
+    if not isinstance(result, dict) or result.get("result") is not True:
+        raise GetCourseError("V2_COMMENT_UNCONFIRMED")
+
 def build_payload(email, order_number, offer_id, comment, first_name="", phone=""):
     if not email or not order_number or not offer_id:
         raise ValueError("Required order parameters missing")

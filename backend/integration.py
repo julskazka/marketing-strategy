@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Blueprint, jsonify, request
-from .getcourse import upsert_order, GetCourseError
+from .getcourse import upsert_order, add_full_order_comment, v2_configured, GetCourseError
 
 api = Blueprint("strategy_api", __name__, url_prefix="/api/strategy")
 ROOT = Path(__file__).resolve().parent.parent
@@ -206,50 +206,32 @@ def send(row, text):
 
 
 def deliver_pending_once():
-    """Send at most one comment; the cursor in /data survives worker restarts."""
+    """Deliver a complete note to the existing deal without touching its status or positions."""
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
-        row = db.execute("SELECT * FROM sessions WHERE delivery='finish_pending' ORDER BY updated_at LIMIT 1").fetchone()
+        row = db.execute("""SELECT * FROM sessions WHERE delivery='finish_pending'
+            OR (delivery='delivery_failed' AND delivery_error IN ('COMMENT_VALIDATION','V2_NOT_CONFIGURED'))
+            ORDER BY updated_at LIMIT 1""").fetchone()
         if not row:
             db.commit()
             return False
         key = row["token_hash"]
-        parts = json.loads(row["delivery_parts"])
-        if not parts:
-            parts = comment_parts(comment(json.loads(row["answers"])))
-            db.execute("UPDATE sessions SET delivery_parts=? WHERE token_hash=?",
-                       (json.dumps(parts, ensure_ascii=False), key))
-        index = row["delivery_index"]
-        if index >= len(parts):
-            db.execute("UPDATE sessions SET delivery='finished',delivery_error='',updated_at=? WHERE token_hash=?", (now(), key))
-            db.commit()
-            return True
-        try:
-            result = send(row, parts[index])
-            if str(result["deal_id"]) != row["deal_id"]:
-                raise GetCourseError("ORDER_ID_MISMATCH")
-        except GetCourseError as exc:
-            code = str(exc)
-            failures = row["delivery_rejections"] + 1
-            if code == "COMMENT_VALIDATION" and len(parts[index].strip()) > 1 and failures < 5 and len(parts) < 128:
-                chunks = comment_parts(parts[index], max(1, len(parts[index]) // 2))
-                if all(chunk.strip() for chunk in chunks):
-                    parts[index:index+1] = chunks
-                    db.execute("UPDATE sessions SET delivery_parts=?,delivery_rejections=?,updated_at=? WHERE token_hash=?",
-                               (json.dumps(parts, ensure_ascii=False), failures, now(), key))
-                    db.commit()
-                    return True
-            state = "delivery_failed" if code == "COMMENT_VALIDATION" or failures >= 3 else "finish_pending"
-            if state == "delivery_failed":
-                logger.warning("STRATEGY_DELIVERY stopped code=%s part=%d chars=%d", code, index + 1, len(parts[index]))
-            db.execute("UPDATE sessions SET delivery=?,delivery_rejections=?,delivery_error=?,updated_at=? WHERE token_hash=?",
-                       (state, failures, code, now(), key))
+        if not v2_configured():
+            db.execute("UPDATE sessions SET delivery='delivery_failed',delivery_error='V2_NOT_CONFIGURED',updated_at=? WHERE token_hash=?",
+                       (now(), key))
             db.commit()
             return False
-        index += 1
-        state = "finished" if index == len(parts) else "finish_pending"
-        db.execute("UPDATE sessions SET delivery=?,delivery_index=?,delivery_rejections=0,delivery_error='',updated_at=? WHERE token_hash=?",
-                   (state, index, now(), key))
+        try:
+            add_full_order_comment(row["deal_id"], comment(json.loads(row["answers"])))
+        except GetCourseError as exc:
+            code = str(exc)
+            logger.warning("STRATEGY_DELIVERY stopped code=%s", code)
+            db.execute("UPDATE sessions SET delivery='delivery_failed',delivery_error=?,updated_at=? WHERE token_hash=?",
+                       (code, now(), key))
+            db.commit()
+            return False
+        db.execute("UPDATE sessions SET delivery='finished',delivery_error='',updated_at=? WHERE token_hash=?",
+                   (now(), key))
         db.commit()
         return True
 

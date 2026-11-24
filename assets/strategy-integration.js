@@ -33,7 +33,7 @@
     return data;
   }
   function displayStatus() {
-    if (!["question","review","result"].includes(screen)) return;
+    if (!["question","review"].includes(screen)) return;
     let status = document.getElementById("strategy-status");
     if (!status) {
       status = document.createElement("p");
@@ -81,7 +81,7 @@
         await call("save", {answers:snapshot});
         saveError = "";
       } catch {
-        saveError = "Ответ пока не сохранён на сервере. Следующая отправка повторит сохранение.";
+        saveError = "Не удалось сохранить ответ. Проверьте соединение и повторите действие.";
       }
       displayStatus();
     });
@@ -97,22 +97,6 @@
     selected = Array.isArray(answers[current]) ? [...answers[current]] : [];
     editing = false;
     go("question");
-  }
-  async function watchDelivery() {
-    if (screen !== "result") return;
-    try {
-      const data = await call("delivery");
-      if (data.delivery === "finished") {
-        saveError = "Ответы переданы в GetCourse.";
-      } else if (data.delivery === "delivery_failed") {
-        saveError = "План готов, ответы сохранены. Передачу в GetCourse нужно проверить.";
-      } else {
-        saveError = "План готов, ответы сохранены. Передаём их в GetCourse.";
-      }
-      displayStatus();
-      if (data.delivery === "finished" || data.delivery === "delivery_failed") return;
-    } catch { /* The plan is available even when the status request fails. */ }
-    setTimeout(watchDelivery, 5000);
   }
   app.addEventListener("submit", async e => {
     if (e.target.id !== "contact-form") return;
@@ -148,9 +132,8 @@
     try {
       await pending;
       await call("finish", {answers: Engine.clean(answers)});
-      saveError = "План готов, ответы сохранены. Передаём их в GetCourse.";
+      saveError = "";
       go("result");
-      watchDelivery();
     } catch (error) {
       saveError = error.message || "Не удалось подтвердить отправку. Попробуйте ещё раз.";
       displayStatus();

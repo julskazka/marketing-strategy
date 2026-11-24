@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 from backend.app import app
 from backend.getcourse import GetCourseError
-from backend.integration import comment, comment_parts, route, schema, database, digest, order_number, deliver_pending_once
+from backend.integration import comment, route, schema, database, digest, order_number, deliver_pending_once
 
 
 class IntegrationTests(unittest.TestCase):
@@ -36,13 +36,6 @@ class IntegrationTests(unittest.TestCase):
     def post(self, method, **data):
         return self.client.post("/api/strategy/" + method, json=data)
 
-    def finish_all(self):
-        for _ in range(128):
-            if self.post("delivery", token=self.token).json["delivery"] == "finished":
-                return
-            deliver_pending_once()
-        self.fail("Background delivery did not finish")
-
     @patch("backend.integration.upsert_order", return_value={"deal_id": 7})
     def test_same_order_and_readable_answers(self, send):
         self.assertEqual(self.post("start", **self.person).status_code, 200)
@@ -54,12 +47,12 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(first.status_code, 200)
         self.assertTrue(first.json["queued"])
         self.assertEqual(send.call_count, 1)  # result is available before GetCourse delivery
-        self.finish_all()
-        self.finish_all()
-        self.assertEqual(send.call_count, 1 + len(comment_parts(comment(self.answers))))
-        self.assertTrue(all(c.args[1] == send.call_args_list[0].args[1]
-                            for c in send.call_args_list))
-        self.assertEqual("".join(c.args[2] for c in send.call_args_list[1:]), comment(self.answers))
+        with patch.dict(os.environ, {"GETCOURSE_DEVELOPER_KEY":"dev"}), patch("backend.integration.add_full_order_comment") as add:
+            self.assertTrue(deliver_pending_once())
+            self.assertFalse(deliver_pending_once())
+            add.assert_called_once_with("7", comment(self.answers))
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(self.post("delivery", token=self.token).json["delivery"], "finished")
 
     @patch("backend.integration.upsert_order")
     def test_start_retry(self, send):
@@ -88,58 +81,25 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(row["deal_id"], "7")
 
     @patch("backend.integration.upsert_order", return_value={"deal_id":7})
-    def test_finish_retry(self, send):
-        self.assertEqual(self.post("start", **self.person).status_code, 200)
-        send.side_effect = [GetCourseError("temporary")] + [{"deal_id":7}] * len(comment_parts(comment(self.answers)))
-        self.assertEqual(self.post("finish", token=self.token, answers=self.answers).status_code, 200)
-        self.assertFalse(deliver_pending_once())
-        self.assertEqual(self.post("resume", token=self.token).json["answers"], self.answers)
-        self.finish_all()
-        self.assertEqual(send.call_args_list[1].args[1], send.call_args_list[2].args[1])
-
-    @patch("backend.integration.upsert_order", return_value={"deal_id":7})
-    def test_comment_validation_splits_and_resumes_without_resending_confirmed_parts(self, send):
-        self.assertEqual(self.post("start", **self.person).status_code, 200)
-        attempted = []
-        def bounded(*args):
-            attempted.append(args[2])
-            if len(args[2]) > 100:
-                raise GetCourseError("COMMENT_VALIDATION")
-            return {"deal_id":7}
-        send.side_effect = bounded
-        self.assertEqual(self.post("finish", token=self.token, answers=self.answers).status_code, 200)
-        self.finish_all()
-        accepted = [text for text in attempted if len(text) <= 100]
-        self.assertEqual("".join(accepted), comment(self.answers))
-        self.finish_all()
-        self.assertEqual(len(attempted), len(send.call_args_list)-1)
-
-    @patch("backend.integration.upsert_order", return_value={"deal_id":7})
-    def test_mid_delivery_retry_resumes_next_part(self, send):
-        self.assertEqual(self.post("start", **self.person).status_code, 200)
-        chunks = comment_parts(comment(self.answers))
-        sent = []
-        def interrupted(*args):
-            sent.append(args[2])
-            if len(sent) == 2:
-                raise GetCourseError("NETWORK_ERROR")
-            return {"deal_id":7}
-        send.side_effect = interrupted
-        self.assertTrue(self.post("finish", token=self.token, answers=self.answers).json["queued"])
-        self.assertTrue(deliver_pending_once())
-        self.assertFalse(deliver_pending_once())
-        self.finish_all()
-        self.assertEqual(sent, [chunks[0], chunks[1], *chunks[1:]])
-
-    @patch("backend.integration.upsert_order", return_value={"deal_id":7})
-    def test_repeated_validation_failure_stops_background_loop(self, send):
+    def test_missing_v2_key_keeps_answers_for_later_delivery(self, send):
         self.assertEqual(self.post("start", **self.person).status_code, 200)
         self.assertTrue(self.post("finish", token=self.token, answers=self.answers).json["queued"])
-        send.side_effect = GetCourseError("COMMENT_VALIDATION")
-        for _ in range(10):
-            deliver_pending_once()
+        self.assertFalse(deliver_pending_once())
         self.assertEqual(self.post("delivery", token=self.token).json["delivery"], "delivery_failed")
-        self.assertLessEqual(send.call_count, 6)
+        self.assertEqual(self.post("resume", token=self.token).json["answers"], self.answers)
+        with patch.dict(os.environ, {"GETCOURSE_DEVELOPER_KEY":"dev"}), patch("backend.integration.add_full_order_comment") as add:
+            self.assertTrue(deliver_pending_once())
+            add.assert_called_once_with("7", comment(self.answers))
+
+    @patch("backend.integration.upsert_order", return_value={"deal_id":7})
+    def test_v2_failure_stops_retries_without_losing_answers(self, send):
+        self.assertEqual(self.post("start", **self.person).status_code, 200)
+        self.assertTrue(self.post("finish", token=self.token, answers=self.answers).json["queued"])
+        with patch.dict(os.environ, {"GETCOURSE_DEVELOPER_KEY":"dev"}), patch("backend.integration.add_full_order_comment", side_effect=GetCourseError("V2_HTTP_403")) as add:
+            self.assertFalse(deliver_pending_once())
+            self.assertFalse(deliver_pending_once())
+            add.assert_called_once()
+        self.assertEqual(self.post("delivery", token=self.token).json["delivery"], "delivery_failed")
 
     @patch("backend.integration.upsert_order", return_value={"deal_id":7})
     def test_consent_and_required_answers(self, send):
