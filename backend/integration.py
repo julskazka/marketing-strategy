@@ -273,6 +273,28 @@ def start_delivery_worker():
     if not config()["enabled"]:
         return
     def loop():
+        # Retry the saved, completed questionnaires immediately after a restart
+        # (for example, after the owner fixes the webhook URL or secret).
+        # Do not touch incomplete questionnaires or already confirmed backups.
+        try:
+            with database() as db:
+                pending = db.execute("""SELECT COUNT(*) FROM sessions
+                    WHERE deal_id IS NOT NULL
+                    AND delivery IN ('finish_pending','delivery_failed','finished')
+                    AND sheet_delivery='pending'""").fetchone()[0]
+                if sheets_configured():
+                    db.execute("""UPDATE sessions SET sheet_retry_at=''
+                        WHERE deal_id IS NOT NULL
+                        AND delivery IN ('finish_pending','delivery_failed','finished')
+                        AND sheet_delivery='pending'""")
+                    db.commit()
+                gc_pending = db.execute("""SELECT COUNT(*) FROM sessions
+                    WHERE deal_id IS NOT NULL
+                    AND delivery IN ('finish_pending','delivery_failed')""").fetchone()[0]
+            logger.info("STRATEGY_BACKUP startup configured=%s pending_completed=%d", sheets_configured(), pending)
+            logger.info("STRATEGY_DELIVERY startup v2_configured=%s pending_completed=%d", v2_configured(), gc_pending)
+        except (OSError, sqlite3.Error) as exc:
+            logger.warning("STRATEGY_BACKUP startup_error=%s", type(exc).__name__)
         while True:
             try:
                 if backup_pending_once():
