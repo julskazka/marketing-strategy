@@ -1,8 +1,8 @@
-/* Live-mode integration; the original preview remains unchanged when disabled. */
+/* Questionnaire UI and guarded GetCourse integration. */
 (() => {
   "use strict";
   const cfg = window.STRATEGY_CONFIG;
-  if (!cfg?.enabled) return;
+  if (!cfg) return;
   const tokenKey = "loons-strategy-session-v1";
   let token = "", confirmed = false, busy = false, pending = Promise.resolve(), saveError = "";
   try { token = sessionStorage.getItem(tokenKey) || ""; } catch {}
@@ -12,7 +12,7 @@
   const preview = document.querySelector(".preview-bar");
   if (preview) preview.hidden = true;
   if (preview) preview.style.display = "none";
-  if (footer) footer.textContent = "Индивидуальная маркетинговая стратегия";
+  if (footer) footer.remove();
   answers = {};
   function ensureToken() {
     if (!token) {
@@ -59,7 +59,7 @@
       check.checked = confirmed; check.style.cssText = "width:18px;height:18px;flex:0 0 18px;margin-top:3px";
       const copy = document.createElement("span");
       const link = (url, name) => { const a = document.createElement("a"); a.href = url; a.textContent = name; a.target = "_blank"; a.rel = "noopener noreferrer"; a.style.textDecoration = "underline"; return a; };
-      copy.append("Я даю ", link(cfg.consent_url, "согласие на обработку персональных данных"), " и ознакомилась с ", link(cfg.policy_url, "политикой обработки персональных данных"), ".");
+      copy.append(link(cfg.consent_url, "Согласна на обработку данных и получение сообщения от LOONSISTERS по результатам диагностики."));
       box.append(check,copy);
       form.insertBefore(box, form.querySelector("#contact-error"));
       if (confirmed) {
@@ -106,6 +106,7 @@
     const phone = String(f.get("phone"));
     const name = String(f.get("name")).trim(), email = String(f.get("email")).trim();
     const err = e.target.querySelector("#contact-error");
+    if (!cfg.enabled) { err.textContent = "Приём анкет временно недоступен. Попробуйте немного позже."; return; }
     if (!name || phone.replace(/\D/g,"").length < 10 || phone.replace(/\D/g,"").length > 15) {
       err.textContent = "Проверьте имя и номер телефона."; return;
     }
@@ -140,7 +141,7 @@
       busy = false; b.disabled = false; b.textContent = "Да, показать мой план";
     }
   }, true);
-  if (token) {
+  if (token && cfg.enabled) {
     busy = true;
     call("resume").then(data => { restore(data); if (screen === "welcome" || screen === "contact") render(); })
       .catch(()=>{}).finally(()=>{busy=false;});
