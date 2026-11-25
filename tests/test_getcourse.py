@@ -90,7 +90,7 @@ class GetCourseTests(unittest.TestCase):
     @patch.dict(os.environ, {"GETCOURSE_LIVE":"1", "GETCOURSE_ACCOUNT":"test",
                           "GETCOURSE_OFFER_ID":"8952690", "GETCOURSE_API_KEY":"fake"})
     @patch("backend.getcourse.urlopen")
-    def test_legacy_comment_sends_no_offer_price_status_or_user_change(self, urlopen):
+    def test_legacy_comment_sends_original_offer_without_explicit_price_or_status(self, urlopen):
         class Response(io.BytesIO):
             status = 200
         urlopen.return_value.__enter__.return_value = Response(json.dumps({
@@ -100,9 +100,9 @@ class GetCourseTests(unittest.TestCase):
         fields = parse_qs(urlopen.call_args.args[0].data.decode())
         self.assertEqual(fields["key"], ["fake"])
         payload = json.loads(base64.b64decode(fields["params"][0]))
-        self.assertEqual(payload["deal"], {"deal_number":"800000000123","deal_comment":"Ответы"})
+        self.assertEqual(payload["deal"], {"deal_number":"800000000123","offer_id":8952690,"deal_comment":"Ответы"})
         self.assertEqual(payload["user"], {"email":"test@example.invalid"})
-        self.assertEqual(payload["system"]["refresh_if_exists"], 0)
+        self.assertEqual(payload["system"], {"return_deal_number":1})
 
     @patch.dict(os.environ, {"GETCOURSE_LIVE":"1", "GETCOURSE_ACCOUNT":"test",
                           "GETCOURSE_OFFER_ID":"8952690", "GETCOURSE_API_KEY":"fake"})
@@ -116,3 +116,18 @@ class GetCourseTests(unittest.TestCase):
         with self.assertRaisesRegex(GetCourseError, "ORDER_ID_MISMATCH"):
             add_legacy_order_comment("test@example.invalid", "800000000123", "42", "Ответы")
         self.assertEqual(urlopen.call_count, 1)
+
+    @patch.dict(os.environ, {"GETCOURSE_LIVE":"1", "GETCOURSE_ACCOUNT":"test",
+                          "GETCOURSE_OFFER_ID":"8952690", "GETCOURSE_API_KEY":"fake"})
+    @patch("backend.getcourse.urlopen")
+    def test_automatic_number_returned_by_getcourse(self, urlopen):
+        class Response(io.BytesIO):
+            status = 200
+        urlopen.return_value.__enter__.return_value = Response(json.dumps({
+            "success":True,"result":{"success":True,"error":False,"deal_id":42,"deal_number":123456}
+        }).encode())
+        result = upsert_order("test@example.invalid", None, "Анкета начата")
+        fields = parse_qs(urlopen.call_args.args[0].data.decode())
+        payload = json.loads(base64.b64decode(fields["params"][0]))
+        self.assertNotIn("deal_number", payload["deal"])
+        self.assertEqual(result["deal_number"], 123456)
