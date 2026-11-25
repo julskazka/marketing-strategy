@@ -5,7 +5,7 @@ import base64
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs
-from backend.getcourse import build_payload, upsert_order, add_full_order_comment, GetCourseError, rejection_code
+from backend.getcourse import build_payload, upsert_order, add_full_order_comment, add_legacy_order_comment, GetCourseError, rejection_code
 
 class GetCourseTests(unittest.TestCase):
     def test_same_order_number(self):
@@ -85,4 +85,34 @@ class GetCourseTests(unittest.TestCase):
         }).encode())
         with self.assertRaises(GetCourseError):
             add_full_order_comment("42", "Анкета")
+        self.assertEqual(urlopen.call_count, 1)
+
+    @patch.dict(os.environ, {"GETCOURSE_LIVE":"1", "GETCOURSE_ACCOUNT":"test",
+                          "GETCOURSE_OFFER_ID":"8952690", "GETCOURSE_API_KEY":"fake"})
+    @patch("backend.getcourse.urlopen")
+    def test_legacy_comment_sends_no_offer_price_status_or_user_change(self, urlopen):
+        class Response(io.BytesIO):
+            status = 200
+        urlopen.return_value.__enter__.return_value = Response(json.dumps({
+            "success":True,"result":{"success":True,"error":False,"deal_id":42,"deal_number":800000000123}
+        }).encode())
+        add_legacy_order_comment("test@example.invalid", "800000000123", "42", "Ответы")
+        fields = parse_qs(urlopen.call_args.args[0].data.decode())
+        self.assertEqual(fields["key"], ["fake"])
+        payload = json.loads(base64.b64decode(fields["params"][0]))
+        self.assertEqual(payload["deal"], {"deal_number":"800000000123","deal_comment":"Ответы"})
+        self.assertEqual(payload["user"], {"email":"test@example.invalid"})
+        self.assertEqual(payload["system"]["refresh_if_exists"], 0)
+
+    @patch.dict(os.environ, {"GETCOURSE_LIVE":"1", "GETCOURSE_ACCOUNT":"test",
+                          "GETCOURSE_OFFER_ID":"8952690", "GETCOURSE_API_KEY":"fake"})
+    @patch("backend.getcourse.urlopen")
+    def test_legacy_comment_refuses_wrong_deal_id(self, urlopen):
+        class Response(io.BytesIO):
+            status = 200
+        urlopen.return_value.__enter__.return_value = Response(json.dumps({
+            "success":True,"result":{"success":True,"error":False,"deal_id":43,"deal_number":800000000123}
+        }).encode())
+        with self.assertRaisesRegex(GetCourseError, "ORDER_ID_MISMATCH"):
+            add_legacy_order_comment("test@example.invalid", "800000000123", "42", "Ответы")
         self.assertEqual(urlopen.call_count, 1)
