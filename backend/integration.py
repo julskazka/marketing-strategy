@@ -7,12 +7,14 @@ import re
 import sqlite3
 import threading
 import logging
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from flask import Blueprint, jsonify, request
-from .getcourse import upsert_order, add_legacy_order_comment, GetCourseError
+from .getcourse import (upsert_order, add_legacy_order_comment, GetCourseError,
+                         start_completed_order_export, read_completed_order_export)
 from .sheets_backup import send_backup, configured as sheets_configured, SheetsError
 
 api = Blueprint("strategy_api", __name__, url_prefix="/api/strategy")
@@ -425,6 +427,120 @@ def legacy_full_comment_probe():
     return state["status"] == "pending"
 
 
+# Production delivery after the owner verified the full, flattened comment.
+# Use one read-only export for a batch, not a separate export for every order.
+FLAT_ELIGIBLE_ERRORS = ("", "COMMENT_VALIDATION", "V2_NOT_CONFIGURED", "LEGACY_COMMENT_VALIDATION")
+FLAT_EXPORT_INTERVAL = 900
+
+
+def flat_comment(answers):
+    return " | ".join(line.strip() for line in comment(answers).splitlines() if line.strip())
+
+
+def reconcile_verified_pilot():
+    """A confirmed pilot is already delivered; do not send it twice."""
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("""SELECT * FROM sessions WHERE order_number=? AND deal_id IS NOT NULL
+            AND delivery IN ('finish_pending','delivery_failed')""", (FRESH_TEST_ORDER,)).fetchone()
+        if row:
+            progress = json.loads(row["legacy_progress"])
+            state = progress.get("fresh_format_probe") or {}
+            if (state.get("mode") == "flat" and state.get("status") == "confirmed"
+                    and state.get("index") == 1 and state.get("parts") == [flat_comment(json.loads(row["answers"]))]):
+                db.execute("""UPDATE sessions SET delivery='finished',delivery_error='',
+                    sheet_delivery='pending',sheet_retry_at='' WHERE token_hash=?""", (row["token_hash"],))
+                logger.info("STRATEGY_DELIVERY flat_pilot_already_confirmed order=%s", FRESH_TEST_ORDER)
+        db.commit()
+
+
+def flat_candidates():
+    with database() as db:
+        rows = db.execute("""SELECT * FROM sessions WHERE deal_id IS NOT NULL
+            AND delivery IN ('finish_pending','delivery_failed')
+            AND delivery_error IN ('','COMMENT_VALIDATION','V2_NOT_CONFIGURED','LEGACY_COMMENT_VALIDATION')
+            ORDER BY consent_at""").fetchall()
+    return rows
+
+
+def flat_deliver_batch(rows, verified):
+    """Only send when a current completed-order export matches all identity fields."""
+    sent = held = failed = 0
+    for candidate in rows:
+        key = candidate["token_hash"]
+        with database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM sessions WHERE token_hash=?", (key,)).fetchone()
+            if (not row or row["delivery"] not in ("finish_pending", "delivery_failed")
+                    or row["delivery_error"] not in FLAT_ELIGIBLE_ERRORS
+                    or row["answers"] != candidate["answers"]):
+                db.commit()
+                continue
+            progress = json.loads(row["legacy_progress"])
+            old_probe = progress.get("offer_short_probe") or progress.get("short_probe")
+            fmt = progress.get("fresh_format_probe") or {}
+            identity = (str(row["deal_id"]), row["order_number"], row["email"].strip().lower())
+            # Never repeat an uncertain write, or send to the old pilot whose
+            # legacy import already returned a different internal order ID.
+            if (progress.get("flat_delivery") == "inflight" or progress.get("inflight")
+                    or fmt.get("inflight") or progress.get("fresh_probe") == "inflight"
+                    or progress.get("fresh_full_probe") == "inflight"
+                    or old_probe in ("ORDER_ID_MISMATCH", "inflight")
+                    or row["order_number"] == LEGACY_PILOT_ORDER):
+                reason = "GC_MANUAL_REVIEW"
+            elif identity not in verified:
+                reason = "GC_ORDER_NOT_CONFIRMED"
+            else:
+                reason = ""
+            if reason:
+                db.execute("UPDATE sessions SET delivery='delivery_failed',delivery_error=? WHERE token_hash=?",
+                           (reason, key))
+                db.commit()
+                held += 1
+                logger.info("STRATEGY_DELIVERY flat_held order=%s code=%s", row["order_number"], reason)
+                continue
+            snapshot = row["answers"]
+            text = flat_comment(json.loads(snapshot))
+            progress["flat_delivery"] = "inflight"
+            db.execute("UPDATE sessions SET legacy_progress=? WHERE token_hash=?",
+                       (json.dumps(progress, ensure_ascii=False), key))
+            db.commit()
+        try:
+            add_legacy_order_comment(row["email"], row["order_number"], row["deal_id"], text)
+            outcome = "CONFIRMED"
+        except GetCourseError as exc:
+            outcome = str(exc)
+        progress["flat_delivery"] = outcome
+        ok = outcome == "CONFIRMED"
+        with database() as db:
+            db.execute("""UPDATE sessions SET legacy_progress=?,delivery=?,delivery_error=?,
+                 sheet_delivery=CASE WHEN ? THEN 'pending' ELSE sheet_delivery END,
+                 sheet_retry_at=CASE WHEN ? THEN '' ELSE sheet_retry_at END
+                 WHERE token_hash=? AND answers=? AND delivery IN ('finish_pending','delivery_failed')""",
+                 (json.dumps(progress, ensure_ascii=False), "finished" if ok else "delivery_failed",
+                  "" if ok else "FLAT_"+outcome, ok, ok, key, snapshot))
+            db.commit()
+        if ok:
+            sent += 1
+        else:
+            failed += 1
+        logger.info("STRATEGY_DELIVERY flat_result order=%s result=%s", row["order_number"], outcome)
+        # Stop the batch if the API unexpectedly created another order or its
+        # response is ambiguous. Remaining rows stay queued.
+        if not ok and outcome != "COMMENT_VALIDATION":
+            break
+    logger.info("STRATEGY_DELIVERY flat_batch confirmed=%d held=%d failed=%d", sent, held, failed)
+
+
+def flat_export_batch(rows):
+    dates = [datetime.fromisoformat(r["consent_at"]).date() for r in rows]
+    start = (min(dates) - timedelta(days=1)).isoformat()
+    end = (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
+    export_id = start_completed_order_export(start, end)
+    logger.info("STRATEGY_DELIVERY completed_export_started candidates=%d", len(rows))
+    return export_id
+
+
 def start_delivery_worker():
     if not config()["enabled"]:
         return
@@ -448,19 +564,50 @@ def start_delivery_worker():
                     WHERE deal_id IS NOT NULL
                     AND delivery IN ('finish_pending','delivery_failed')""").fetchone()[0]
             logger.info("STRATEGY_BACKUP startup configured=%s pending_completed=%d", sheets_configured(), pending)
-            logger.info("STRATEGY_DELIVERY startup method=legacy_comment rollout=%s pending_completed=%d", legacy_rollout_enabled(), gc_pending)
+            logger.info("STRATEGY_DELIVERY startup method=flat_verified_export pending_completed=%d", gc_pending)
         except (OSError, sqlite3.Error) as exc:
             logger.warning("STRATEGY_BACKUP startup_error=%s", type(exc).__name__)
+        # The successful flat pilot is the only proof accepted for migration.
+        # Preserve Google backup priority; poll the read-only export no more
+        # than every 30 seconds, and start at most one batch per 15 minutes.
+        next_export = 0
+        export_id = None
+        export_rows = []
+        poll_at = 0
+        deadline = 0
         while True:
             try:
+                reconcile_verified_pilot()
                 if backup_pending_once():
                     continue
-                if legacy_full_comment_probe():
-                    continue
-                if legacy_rollout_enabled() and deliver_pending_once():
-                    continue
+                clock = time.monotonic()
+                if export_id and clock >= poll_at:
+                    if clock >= deadline:
+                        logger.warning("STRATEGY_DELIVERY completed_export_timeout")
+                        export_id = None
+                    else:
+                        verified = read_completed_order_export(export_id)
+                        if verified is None:
+                            poll_at = clock + 30
+                        else:
+                            export_id = None
+                            flat_deliver_batch(export_rows, verified)
+                            continue
+                if not export_id and clock >= next_export:
+                    export_rows = flat_candidates()
+                    if export_rows:
+                        next_export = clock + FLAT_EXPORT_INTERVAL
+                        export_id = flat_export_batch(export_rows)
+                        poll_at = clock + 10
+                        deadline = clock + 300
+            except GetCourseError as exc:
+                logger.warning("STRATEGY_DELIVERY completed_export_blocked code=%s", str(exc))
+                export_id = None
+                next_export = time.monotonic() + FLAT_EXPORT_INTERVAL
             except (OSError, sqlite3.Error, ValueError) as exc:
                 logger.warning("STRATEGY_DELIVERY worker_error=%s", type(exc).__name__)
+                export_id = None
+                next_export = time.monotonic() + FLAT_EXPORT_INTERVAL
             delivery_wakeup.wait(10)
             delivery_wakeup.clear()
     threading.Thread(target=loop, name="strategy-delivery", daemon=True).start()
