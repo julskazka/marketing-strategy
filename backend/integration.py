@@ -216,6 +216,10 @@ def send(row, text):
 LEGACY_PILOT_ORDER = "803481980570"
 
 
+def auto_order_number_enabled():
+    return os.getenv("GETCOURSE_AUTO_ORDER_NUMBER", "0") == "1"
+
+
 def legacy_rollout_enabled():
     return os.getenv("GETCOURSE_COMMENT_ROLLOUT", "0") == "1"
 
@@ -252,6 +256,16 @@ def deliver_pending_once():
                           sheet_delivery='pending',sheet_retry_at=''
                           WHERE order_number=? AND delivery='delivery_failed'
                           AND delivery_error='LEGACY_PILOT_CHECK'""", (LEGACY_PILOT_ORDER,))
+        # Reopen only the rejected pilot, once, for the corrected offer-bearing request.
+        pilot = db.execute("""SELECT * FROM sessions WHERE order_number=?
+            AND delivery='delivery_failed' AND delivery_error='LEGACY_COMMENT_VALIDATION'""",
+            (LEGACY_PILOT_ORDER,)).fetchone()
+        if pilot:
+            previous = json.loads(pilot["legacy_progress"])
+            if previous.get("index") == 0 and not previous.get("inflight") and previous.get("short_probe") in ("API_REJECTED", "COMMENT_VALIDATION") and not previous.get("offer_retry"):
+                db.execute("""UPDATE sessions SET delivery='finish_pending',delivery_error='',legacy_progress=?
+                    WHERE token_hash=?""", (json.dumps({"parts":[comment(json.loads(pilot["answers"]))],
+                    "index":0,"inflight":False,"offer_retry":True}, ensure_ascii=False), pilot["token_hash"]))
         row = db.execute("""SELECT * FROM sessions WHERE deal_id IS NOT NULL
             AND delivery IN ('finish_pending','delivery_failed')
             AND delivery_error IN ('','COMMENT_VALIDATION','V2_NOT_CONFIGURED')
@@ -285,7 +299,7 @@ def deliver_pending_once():
         code = str(exc)
         with database() as db:
             progress["inflight"] = False
-            if code == "COMMENT_VALIDATION" and len(parts) == 1 and len(part.encode("utf-8")) > 180:
+            if code == "COMMENT_VALIDATION" and not progress.get("offer_retry") and len(parts) == 1 and len(part.encode("utf-8")) > 180:
                 progress = {"parts": legacy_comment_parts(part), "index": 0, "inflight": False}
                 db.execute("""UPDATE sessions SET legacy_progress=?,delivery='finish_pending',delivery_error=''
                            WHERE token_hash=? AND answers=? AND delivery IN ('finish_pending','delivery_failed')""",
@@ -412,8 +426,6 @@ def start_delivery_worker():
             try:
                 if backup_pending_once():
                     continue
-                if legacy_short_comment_probe():
-                    continue
                 if deliver_pending_once():
                     continue
             except (OSError, sqlite3.Error, ValueError) as exc:
@@ -452,14 +464,17 @@ def start():
         return error(str(exc))
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
+        # Only new sessions may opt into GetCourse-generated numbers. A unique local
+        # placeholder is never sent to GetCourse and is replaced after confirmation.
+        initial_number = "auto:" + key if auto_order_number_enabled() else order_number(key)
         db.execute("""INSERT OR IGNORE INTO sessions
             (token_hash,order_number,name,email,phone,consent_at,consent_url,policy_url,updated_at)
             VALUES (?,?,?,?,?,?,?,?,?)""",
-            (key, order_number(key), name, email, phone, now(), cfg["consent_url"], cfg["policy_url"], now()))
+            (key, initial_number, name, email, phone, now(), cfg["consent_url"], cfg["policy_url"], now()))
         row = db.execute("SELECT * FROM sessions WHERE token_hash=?", (key,)).fetchone()
         # Earlier versions stored an alphanumeric number rejected by GetCourse.
         # Migrate only sessions without a confirmed deal, preserving established IDs.
-        if not row["deal_id"] and not row["order_number"].isdigit():
+        if not row["deal_id"] and not row["order_number"].isdigit() and not row["order_number"].startswith("auto:"):
             db.execute("UPDATE sessions SET order_number=? WHERE token_hash=?",
                        (order_number(key), key))
             row = db.execute("SELECT * FROM sessions WHERE token_hash=?", (key,)).fetchone()
@@ -471,13 +486,23 @@ def start():
         db.execute("BEGIN IMMEDIATE")
         row = db.execute("SELECT * FROM sessions WHERE token_hash=?", (key,)).fetchone()
         if not row["deal_id"]:
+            auto = row["order_number"].startswith("auto:")
+            if auto:
+                # Persist uncertainty BEFORE calling an API without an idempotency key.
+                if row["delivery"] == "auto_create_inflight":
+                    db.commit()
+                    return error("Не удалось подтвердить заказ. Обратитесь в поддержку.", 502)
+                db.execute("UPDATE sessions SET delivery='auto_create_inflight' WHERE token_hash=?", (key,))
+                db.commit()
             try:
-                result = send(row, "Индивидуальная маркетинговая стратегия\nАнкета начата, ответы ещё не отправлены.")
+                initial_comment = "Индивидуальная маркетинговая стратегия\nАнкета начата, ответы ещё не отправлены."
+                result = upsert_order(row["email"], None, initial_comment, row["name"], row["phone"]) if auto else send(row, initial_comment)
             except GetCourseError:
                 db.commit()
-                return error("Не удалось подтвердить заказ. Нажмите кнопку ещё раз.", 502)
-            db.execute("UPDATE sessions SET deal_id=?,delivery='started',updated_at=? WHERE token_hash=?",
-                       (str(result["deal_id"]), now(), key))
+                return error("Не удалось подтвердить заказ. Обратитесь в поддержку." if auto else "Не удалось подтвердить заказ. Нажмите кнопку ещё раз.", 502)
+            number = str(result["deal_number"]) if auto else row["order_number"]
+            db.execute("UPDATE sessions SET order_number=?,deal_id=?,delivery='started',updated_at=? WHERE token_hash=?",
+                       (number, str(result["deal_id"]), now(), key))
         db.commit()
         return jsonify(ok=True, answers=json.loads(row["answers"]), person={k:row[k] for k in ("name","email","phone")})
 
