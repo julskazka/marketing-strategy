@@ -346,6 +346,42 @@ def backup_pending_once():
     return True
 
 
+def legacy_short_comment_probe():
+    """One-time diagnostic after the first pilot part was explicitly rejected."""
+    if legacy_rollout_enabled():
+        return False
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("""SELECT * FROM sessions WHERE order_number=? AND deal_id IS NOT NULL
+            AND delivery='delivery_failed' AND delivery_error='LEGACY_COMMENT_VALIDATION'""",
+            (LEGACY_PILOT_ORDER,)).fetchone()
+        if not row:
+            db.commit()
+            return False
+        progress = json.loads(row["legacy_progress"])
+        if progress.get("inflight") or progress.get("index") != 0 or progress.get("short_probe"):
+            db.commit()
+            return False
+        progress["short_probe"] = "inflight"
+        db.execute("UPDATE sessions SET legacy_progress=? WHERE token_hash=?",
+                   (json.dumps(progress, ensure_ascii=False), row["token_hash"]))
+        db.commit()
+    try:
+        add_legacy_order_comment(row["email"], row["order_number"], row["deal_id"], "Анкета заполнена")
+        outcome = "CONFIRMED"
+    except GetCourseError as exc:
+        outcome = str(exc)
+    with database() as db:
+        progress["short_probe"] = outcome
+        db.execute("""UPDATE sessions SET legacy_progress=?
+                   WHERE token_hash=? AND answers=? AND delivery='delivery_failed'
+                   AND delivery_error='LEGACY_COMMENT_VALIDATION'""",
+                   (json.dumps(progress, ensure_ascii=False), row["token_hash"], row["answers"]))
+        db.commit()
+    logger.info("STRATEGY_DELIVERY legacy_short_probe result=%s order=%s", outcome, LEGACY_PILOT_ORDER)
+    return True
+
+
 def start_delivery_worker():
     if not config()["enabled"]:
         return
@@ -375,6 +411,8 @@ def start_delivery_worker():
         while True:
             try:
                 if backup_pending_once():
+                    continue
+                if legacy_short_comment_probe():
                     continue
                 if deliver_pending_once():
                     continue
