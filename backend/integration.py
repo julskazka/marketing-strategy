@@ -364,7 +364,8 @@ FRESH_TEST_ORDER = "833386061443"
 
 
 def legacy_full_comment_probe():
-    """Send the full questionnaire once, only after the short probe was confirmed."""
+    """Fresh order only. After explicit full-text rejection, test one-line text,
+    then conservative numbered chunks. Never retry an uncertain write."""
     if legacy_rollout_enabled():
         return False
     with database() as db:
@@ -375,26 +376,53 @@ def legacy_full_comment_probe():
             db.commit()
             return False
         progress = json.loads(row["legacy_progress"])
-        if progress.get("inflight") or progress.get("fresh_probe") != "CONFIRMED" or progress.get("fresh_full_probe"):
+        if (progress.get("inflight") or progress.get("fresh_probe") != "CONFIRMED"
+                or progress.get("fresh_full_probe") != "COMMENT_VALIDATION"):
             db.commit()
             return False
-        progress["fresh_full_probe"] = "inflight"
+        state = progress.get("fresh_format_probe")
+        if not state:
+            full = comment(json.loads(row["answers"]))
+            # Keep every nonempty line; use visible separators instead of line breaks.
+            flat = " | ".join(line.strip() for line in full.splitlines() if line.strip())
+            state = {"mode":"flat", "parts":[flat], "index":0, "inflight":False, "status":"pending"}
+        if state["status"] != "pending" or state["inflight"]:
+            db.commit()
+            return False
+        parts, index = state["parts"], state["index"]
+        if index >= len(parts):
+            db.commit()
+            return False
+        state["inflight"] = True
+        progress["fresh_format_probe"] = state
         db.execute("UPDATE sessions SET legacy_progress=? WHERE token_hash=?",
                    (json.dumps(progress, ensure_ascii=False), row["token_hash"]))
         db.commit()
+    text = parts[index] if state["mode"] == "flat" else "%d/%d. %s" % (index+1, len(parts), parts[index])
     try:
-        add_legacy_order_comment(row["email"], row["order_number"], row["deal_id"], comment(json.loads(row["answers"])))
+        add_legacy_order_comment(row["email"], row["order_number"], row["deal_id"], text)
         outcome = "CONFIRMED"
     except GetCourseError as exc:
         outcome = str(exc)
+    state["inflight"] = False
+    if outcome == "CONFIRMED":
+        state["index"] += 1
+        if state["index"] == len(parts):
+            state["status"] = "confirmed"
+    elif outcome == "COMMENT_VALIDATION" and state["mode"] == "flat":
+        state = {"mode":"parts", "parts":legacy_comment_parts(parts[0], 160),
+                 "index":0, "inflight":False, "status":"pending"}
+    else:
+        state["status"] = "stopped:" + outcome
+    progress["fresh_format_probe"] = state
     with database() as db:
         db.execute("""UPDATE sessions SET legacy_progress=?
                    WHERE token_hash=? AND answers=? AND delivery IN ('finish_pending','delivery_failed')""",
-                   (json.dumps({**progress, "fresh_full_probe":outcome}, ensure_ascii=False),
-                    row["token_hash"], row["answers"]))
+                   (json.dumps(progress, ensure_ascii=False), row["token_hash"], row["answers"]))
         db.commit()
-    logger.info("STRATEGY_DELIVERY fresh_full_probe result=%s order=%s", outcome, FRESH_TEST_ORDER)
-    return True
+    logger.info("STRATEGY_DELIVERY fresh_format_probe result=%s mode=%s progress=%d/%d status=%s order=%s",
+                outcome, state["mode"], state["index"], len(state["parts"]), state["status"], FRESH_TEST_ORDER)
+    return state["status"] == "pending"
 
 
 def start_delivery_worker():
