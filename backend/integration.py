@@ -373,10 +373,10 @@ def legacy_short_comment_probe():
             db.commit()
             return False
         progress = json.loads(row["legacy_progress"])
-        if progress.get("inflight") or progress.get("index") != 0 or progress.get("short_probe"):
+        if progress.get("inflight") or progress.get("index") != 0 or not progress.get("offer_retry") or progress.get("offer_short_probe"):
             db.commit()
             return False
-        progress["short_probe"] = "inflight"
+        progress["offer_short_probe"] = "inflight"
         db.execute("UPDATE sessions SET legacy_progress=? WHERE token_hash=?",
                    (json.dumps(progress, ensure_ascii=False), row["token_hash"]))
         db.commit()
@@ -386,13 +386,13 @@ def legacy_short_comment_probe():
     except GetCourseError as exc:
         outcome = str(exc)
     with database() as db:
-        progress["short_probe"] = outcome
+        progress["offer_short_probe"] = outcome
         db.execute("""UPDATE sessions SET legacy_progress=?
                    WHERE token_hash=? AND answers=? AND delivery='delivery_failed'
                    AND delivery_error='LEGACY_COMMENT_VALIDATION'""",
                    (json.dumps(progress, ensure_ascii=False), row["token_hash"], row["answers"]))
         db.commit()
-    logger.info("STRATEGY_DELIVERY legacy_short_probe result=%s order=%s", outcome, LEGACY_PILOT_ORDER)
+    logger.info("STRATEGY_DELIVERY legacy_offer_short_probe result=%s order=%s", outcome, LEGACY_PILOT_ORDER)
     return True
 
 
@@ -425,6 +425,8 @@ def start_delivery_worker():
         while True:
             try:
                 if backup_pending_once():
+                    continue
+                if legacy_short_comment_probe():
                     continue
                 if deliver_pending_once():
                     continue
