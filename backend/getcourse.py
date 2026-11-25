@@ -134,7 +134,7 @@ def build_payload(email, order_number, offer_id, comment, first_name="", phone="
                  "deal_comment": comment},
     }
 
-def upsert_order(email, order_number, comment, first_name="", phone=""):
+def upsert_order(email, order_number, comment, first_name="", phone="", *, existing_deal_id=None):
     if os.getenv("GETCOURSE_LIVE", "0") != "1":
         raise GetCourseError("Live integration disabled")
     account = os.getenv("GETCOURSE_ACCOUNT", "").strip()
@@ -142,7 +142,16 @@ def upsert_order(email, order_number, comment, first_name="", phone=""):
     offer = os.getenv("GETCOURSE_OFFER_ID", "").strip()
     if not re.fullmatch(r"[a-zA-Z0-9-]+", account) or not key or not offer.isdigit():
         fail("CONFIG_MISSING")
-    payload = build_payload(email, order_number, int(offer), comment, first_name, phone)
+    if existing_deal_id is None:
+        payload = build_payload(email, order_number, int(offer), comment, first_name, phone)
+    else:
+        # Try a minimal existing-order update. No offer/price/status/positions:
+        # never fall back to the import payload if this operation is rejected.
+        if not str(existing_deal_id).isdigit() or not str(order_number).isdigit() or not email:
+            raise GetCourseError("INVALID_EXISTING_ORDER")
+        payload = {"user": {"email": email},
+                   "system": {"refresh_if_exists": 0, "return_deal_number": 1},
+                   "deal": {"deal_number": str(order_number), "deal_comment": comment}}
     encoded = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
     secrets = (key, email, first_name, phone, re.sub(r"\D", "", phone), order_number, comment, encoded)
     request = Request(
@@ -163,7 +172,7 @@ def upsert_order(email, order_number, comment, first_name="", phone=""):
         code = rejection_code(body) if isinstance(body, dict) else "API_REJECTED"
         if code == "API_REJECTED":
             code = "HTTP_" + str(exc.code)
-        fail(code, status=exc.code, detail=safe_error_message(body, secrets) if isinstance(body, dict) else "(no error message)")
+        fail(code, status=exc.code, detail=(safe_error_message(body, secrets) if isinstance(body, dict) else "(no error message)") if existing_deal_id is None else "(comment update)")
     except URLError as exc:
         fail("NETWORK_ERROR", reason_type=type(exc.reason).__name__)
     except TimeoutError:
@@ -180,9 +189,16 @@ def upsert_order(email, order_number, comment, first_name="", phone=""):
     if not isinstance(result, dict) or not yes(body.get("success")) or not yes(result.get("success")) or yes(result.get("error")):
         fail(rejection_code(body), status=status, top_success=yes(body.get("success")),
              result_success=isinstance(result, dict) and yes(result.get("success")),
-             detail=safe_error_message(body, secrets))
+             detail=safe_error_message(body, secrets) if existing_deal_id is None else "(comment update)")
     if str(result.get("deal_number", "")) != str(order_number) or not result.get("deal_id"):
         fail("ORDER_CONFIRMATION_INCOMPLETE", has_id=bool(result.get("deal_id")),
              has_number=bool(result.get("deal_number")), number_matches=str(result.get("deal_number", "")) == str(order_number))
-    logger.info("GETCOURSE_DIAG ORDER_CONFIRMED")
+    if existing_deal_id is not None and str(result["deal_id"]) != str(existing_deal_id):
+        fail("ORDER_ID_MISMATCH")
+    logger.info("GETCOURSE_DIAG %s", "COMMENT_API_CONFIRMED" if existing_deal_id is not None else "ORDER_CONFIRMED")
     return {"deal_id": result["deal_id"], "deal_number": result["deal_number"]}
+
+
+def add_legacy_order_comment(email, order_number, deal_id, text):
+    """Try the legacy one-key API against the confirmed existing order."""
+    return upsert_order(email, order_number, text, existing_deal_id=deal_id)
