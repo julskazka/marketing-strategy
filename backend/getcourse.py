@@ -122,19 +122,19 @@ def add_full_order_comment(deal_id, text):
         raise GetCourseError("V2_COMMENT_UNCONFIRMED")
 
 def build_payload(email, order_number, offer_id, comment, first_name="", phone=""):
-    if not email or not order_number or not offer_id:
+    if not email or not offer_id:
         raise ValueError("Required order parameters missing")
     user = {"email": email}
     if first_name:
         user["first_name"] = first_name
     if phone:
         user["phone"] = phone
-    return {
-        "user": user,
-        "system": {"refresh_if_exists": 0, "return_deal_number": 1},
-        "deal": {"deal_number": order_number, "offer_id": offer_id,
-                 "deal_comment": comment},
-    }
+    deal = {"offer_id": offer_id, "deal_comment": comment}
+    if order_number is not None:
+        deal["deal_number"] = order_number
+    return {"user": user,
+            "system": {"refresh_if_exists": 0, "return_deal_number": 1},
+            "deal": deal}
 
 def upsert_order(email, order_number, comment, first_name="", phone="", *, existing_deal_id=None):
     if os.getenv("GETCOURSE_LIVE", "0") != "1":
@@ -147,13 +147,14 @@ def upsert_order(email, order_number, comment, first_name="", phone="", *, exist
     if existing_deal_id is None:
         payload = build_payload(email, order_number, int(offer), comment, first_name, phone)
     else:
-        # Try a minimal existing-order update. No offer/price/status/positions:
+        # Match the working business-diagnostic request: same original offer.
         # never fall back to the import payload if this operation is rejected.
         if not str(existing_deal_id).isdigit() or not str(order_number).isdigit() or not email:
             raise GetCourseError("INVALID_EXISTING_ORDER")
         payload = {"user": {"email": email},
-                   "system": {"refresh_if_exists": 0, "return_deal_number": 1},
-                   "deal": {"deal_number": str(order_number), "deal_comment": comment}}
+                   "system": {"return_deal_number": 1},
+                   "deal": {"deal_number": str(order_number), "offer_id": int(offer),
+                            "deal_comment": comment}}
     encoded = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
     secrets = (key, email, first_name, phone, re.sub(r"\D", "", phone), order_number, comment, encoded)
     request = Request(
@@ -192,7 +193,8 @@ def upsert_order(email, order_number, comment, first_name="", phone="", *, exist
         fail(rejection_code(body), status=status, top_success=yes(body.get("success")),
              result_success=isinstance(result, dict) and yes(result.get("success")),
              detail=safe_error_message(body, secrets) if existing_deal_id is None else "(comment update)")
-    if str(result.get("deal_number", "")) != str(order_number) or not result.get("deal_id"):
+    returned_number = str(result.get("deal_number") or "")
+    if not returned_number.isdigit() or (order_number is not None and returned_number != str(order_number)) or not result.get("deal_id"):
         fail("ORDER_CONFIRMATION_INCOMPLETE", has_id=bool(result.get("deal_id")),
              has_number=bool(result.get("deal_number")), number_matches=str(result.get("deal_number", "")) == str(order_number))
     if existing_deal_id is not None and str(result["deal_id"]) != str(existing_deal_id):
