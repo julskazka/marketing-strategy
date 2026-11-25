@@ -16,6 +16,10 @@ def rejection_code(body):
     result = result if isinstance(result, dict) else {}
     msg = " ".join(str(x) for x in (body.get("error"), body.get("error_message"),
                                      result.get("error"), result.get("error_message"))).lower()
+    if "deal_comment" in msg and ("валидац" in msg or "invalid" in msg):
+        return "COMMENT_VALIDATION"
+    if ("предложен" in msg or "offer" in msg) and any(x in msg for x in ("не указано", "не указан", "необходимо указать", "required", "missing")):
+        return "OFFER_REQUIRED"
     if any(x in msg for x in ("неавториз", "invalid key", "unauthoriz", "неверный ключ")):
         return "AUTH_KEY"
     if any(x in msg for x in ("действие запрещено", "forbidden", "access denied", "нет прав", "read only")):
@@ -32,8 +36,6 @@ def rejection_code(body):
         return "ORDER_NUMBER"
     if "№ должен быть целым числом" in msg:
         return "ORDER_NUMBER"
-    if "deal_comment" in msg and ("валидац" in msg or "invalid" in msg):
-        return "COMMENT_VALIDATION"
     return "API_REJECTED"
 
 
