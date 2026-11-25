@@ -206,3 +206,74 @@ def upsert_order(email, order_number, comment, first_name="", phone="", *, exist
 def add_legacy_order_comment(email, order_number, deal_id, text):
     """Try the legacy one-key API against the confirmed existing order."""
     return upsert_order(email, order_number, text, existing_deal_id=deal_id)
+
+
+def legacy_export_request(path, filters=None):
+    """Read-only legacy export; never log URLs or response bodies."""
+    account = os.getenv("GETCOURSE_ACCOUNT", "").strip()
+    key = os.getenv("GETCOURSE_API_KEY", "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9-]+", account) or not key:
+        raise GetCourseError("CONFIG_MISSING")
+    req = Request("https://" + account + ".getcourse.ru/pl/api/account/" + path
+                  + "?" + urlencode({"key": key, **(filters or {})}),
+                  headers={"Accept": "application/json"})
+    try:
+        with urlopen(req, timeout=15) as response:
+            body = json.load(response)
+    except HTTPError as exc:
+        raise GetCourseError("EXPORT_HTTP_" + str(exc.code)) from None
+    except (URLError, OSError, TimeoutError, ValueError, UnicodeError):
+        raise GetCourseError("EXPORT_UNAVAILABLE") from None
+    if not isinstance(body, dict):
+        raise GetCourseError("EXPORT_INVALID")
+    return body
+
+
+def start_completed_order_export(date_from, date_to):
+    body = legacy_export_request("deals", {
+        "created_at[from]": date_from, "created_at[to]": date_to, "status": "payed",
+    })
+    info = body.get("info") or body.get("result") or {}
+    export_id = info.get("export_id") if isinstance(info, dict) else None
+    if not export_id:
+        export_id = body.get("export_id")
+    if str(body.get("success")).lower() not in ("true", "1") or not str(export_id).isdigit():
+        raise GetCourseError("EXPORT_START_REJECTED")
+    return str(export_id)
+
+
+def parse_completed_order_export(body):
+    """Only exact ID/number/email tuples from an explicitly completed export.
+    Ambiguous or unknown columns fail closed, not positional guesses."""
+    info = body.get("info") or body.get("result") or {}
+    if not isinstance(info, dict):
+        raise GetCourseError("EXPORT_INVALID")
+    fields, items = info.get("fields"), info.get("items")
+    if fields is None or items is None:
+        return None
+    if str(body.get("success")).lower() not in ("true", "1") or not isinstance(fields, list) or not isinstance(items, list):
+        raise GetCourseError("EXPORT_INVALID")
+    normalized = [" ".join(str(f).replace("\xa0", " ").strip().lower().split()) for f in fields]
+    def column(*names):
+        indexes = [i for i, f in enumerate(normalized) if f in names]
+        if len(indexes) != 1:
+            raise GetCourseError("EXPORT_COLUMNS")
+        return indexes[0]
+    i, n, e, st = column("id заказа", "deal_id", "id"), column("номер", "номер заказа", "deal_number"), column("email", "e-mail", "эл. почта"), column("статус", "статус заказа", "deal_status", "status")
+    matches, seen = set(), {}
+    for row in items:
+        if not isinstance(row, list) or len(row) <= max(i, n, e, st):
+            raise GetCourseError("EXPORT_ROW")
+        ident, number, email, status = str(row[i]).strip(), str(row[n]).strip(), str(row[e]).strip().lower(), str(row[st]).strip().lower().replace("ё", "е")
+        if not ident.isdigit() or not number.isdigit():
+            continue
+        seen.setdefault(number, set()).add(ident)
+        if status in ("завершен", "payed", "completed", "paid") and email:
+            matches.add((ident, number, email))
+    return {m for m in matches if len(seen[m[1]]) == 1}
+
+
+def read_completed_order_export(export_id):
+    if not str(export_id).isdigit():
+        raise GetCourseError("EXPORT_ID")
+    return parse_completed_order_export(legacy_export_request("exports/" + str(export_id)))
