@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from flask import Blueprint, jsonify, request
-from .getcourse import upsert_order, add_full_order_comment, v2_configured, GetCourseError
+from .getcourse import upsert_order, add_legacy_order_comment, GetCourseError
 from .sheets_backup import send_backup, configured as sheets_configured, SheetsError
 
 api = Blueprint("strategy_api", __name__, url_prefix="/api/strategy")
@@ -65,6 +65,8 @@ def database():
             db.execute("ALTER TABLE sessions ADD COLUMN sheet_delivery TEXT NOT NULL DEFAULT 'pending'")
         if "sheet_retry_at" not in columns:
             db.execute("ALTER TABLE sessions ADD COLUMN sheet_retry_at TEXT NOT NULL DEFAULT ''")
+        if "legacy_progress" not in columns:
+            db.execute("ALTER TABLE sessions ADD COLUMN legacy_progress TEXT NOT NULL DEFAULT '{}'") 
         db.commit()
         yield db
     finally:
@@ -210,35 +212,110 @@ def send(row, text):
     return upsert_order(row["email"], row["order_number"], text, row["name"], row["phone"])
 
 
+# Pilot only on the previously used, confirmed existing order.
+LEGACY_PILOT_ORDER = "803481980570"
+
+
+def legacy_rollout_enabled():
+    return os.getenv("GETCOURSE_COMMENT_ROLLOUT", "0") == "1"
+
+
+def legacy_comment_parts(text, limit=180):
+    """Split on UTF-8 bytes without losing characters."""
+    pieces = []
+    while text:
+        size, count = 0, 0
+        for ch in text:
+            n = len(ch.encode("utf-8"))
+            if size + n > limit:
+                break
+            size += n
+            count += 1
+        if count < len(text):
+            cut = max(text.rfind("\n", 0, count), text.rfind(" ", 0, count))
+            if cut >= count // 2:
+                count = cut + 1
+        if not count:
+            raise ValueError("Invalid comment part limit")
+        pieces.append(text[:count])
+        text = text[count:]
+    return pieces
+
+
 def deliver_pending_once():
-    """Deliver a complete note to the existing deal without touching its status or positions."""
+    """One-key comment pilot; store progress before each request."""
+    rollout = legacy_rollout_enabled()
     with database() as db:
-        row = db.execute("""SELECT * FROM sessions WHERE delivery='finish_pending'
-            OR (delivery='delivery_failed' AND delivery_error IN ('COMMENT_VALIDATION','V2_NOT_CONFIGURED'))
-            ORDER BY updated_at LIMIT 1""").fetchone()
+        db.execute("BEGIN IMMEDIATE")
+        if rollout:
+            db.execute("""UPDATE sessions SET delivery='finished',delivery_error='',
+                          sheet_delivery='pending',sheet_retry_at=''
+                          WHERE order_number=? AND delivery='delivery_failed'
+                          AND delivery_error='LEGACY_PILOT_CHECK'""", (LEGACY_PILOT_ORDER,))
+        row = db.execute("""SELECT * FROM sessions WHERE deal_id IS NOT NULL
+            AND delivery IN ('finish_pending','delivery_failed')
+            AND delivery_error IN ('','COMMENT_VALIDATION','V2_NOT_CONFIGURED')
+            AND (?=1 OR order_number=?)
+            ORDER BY updated_at LIMIT 1""", (int(rollout), LEGACY_PILOT_ORDER)).fetchone()
         if not row:
             db.commit()
             return False
-        if not v2_configured():
-            db.execute("UPDATE sessions SET delivery='delivery_failed',delivery_error='V2_NOT_CONFIGURED',updated_at=? WHERE token_hash=?",
-                       (now(), row["token_hash"]))
+        key, snapshot = row["token_hash"], row["answers"]
+        progress = json.loads(row["legacy_progress"])
+        if progress.get("inflight"):
+            db.execute("UPDATE sessions SET delivery='delivery_failed',delivery_error='LEGACY_UNCERTAIN' WHERE token_hash=?", (key,))
+            db.commit()
+            logger.warning("STRATEGY_DELIVERY legacy_uncertain")
+            return False
+        if not progress:
+            progress = {"parts": [comment(json.loads(snapshot))], "index": 0, "inflight": False}
+        parts, index = progress["parts"], progress["index"]
+        if index >= len(parts):
             db.commit()
             return False
+        progress["inflight"] = True
+        db.execute("UPDATE sessions SET legacy_progress=? WHERE token_hash=?",
+                   (json.dumps(progress, ensure_ascii=False), key))
+        db.commit()
+    part = parts[index]
+    text = part if len(parts) == 1 else "[Анкета %d/%d]\n%s" % (index + 1, len(parts), part)
     try:
-        add_full_order_comment(row["deal_id"], comment(json.loads(row["answers"])))
+        add_legacy_order_comment(row["email"], row["order_number"], row["deal_id"], text)
     except GetCourseError as exc:
         code = str(exc)
-        logger.warning("STRATEGY_DELIVERY stopped code=%s", code)
         with database() as db:
-            db.execute("UPDATE sessions SET delivery='delivery_failed',delivery_error=? WHERE token_hash=? AND answers=? AND delivery='finish_pending'",
-                       (code, row["token_hash"], row["answers"]))
+            progress["inflight"] = False
+            if code == "COMMENT_VALIDATION" and len(parts) == 1 and len(part.encode("utf-8")) > 180:
+                progress = {"parts": legacy_comment_parts(part), "index": 0, "inflight": False}
+                db.execute("""UPDATE sessions SET legacy_progress=?,delivery='finish_pending',delivery_error=''
+                           WHERE token_hash=? AND answers=? AND delivery IN ('finish_pending','delivery_failed')""",
+                           (json.dumps(progress, ensure_ascii=False), key, snapshot))
+                db.commit()
+                logger.info("STRATEGY_DELIVERY legacy_split parts=%d", len(progress["parts"]))
+                return True
+            db.execute("""UPDATE sessions SET legacy_progress=?,delivery='delivery_failed',delivery_error=?
+                       WHERE token_hash=? AND answers=? AND delivery IN ('finish_pending','delivery_failed')""",
+                       (json.dumps(progress, ensure_ascii=False), "LEGACY_" + code, key, snapshot))
             db.commit()
+        logger.warning("STRATEGY_DELIVERY legacy_stopped code=%s part=%d/%d", code, index + 1, len(parts))
         return False
+    progress["inflight"] = False
+    progress["index"] = index + 1
+    complete = progress["index"] == len(parts)
+    state = "finished" if complete and rollout else "delivery_failed" if complete else "finish_pending"
+    error_code = "LEGACY_PILOT_CHECK" if complete and not rollout else ""
     with database() as db:
-        db.execute("UPDATE sessions SET delivery='finished',delivery_error='',sheet_delivery='pending' WHERE token_hash=? AND answers=? AND delivery IN ('finish_pending','delivery_failed')",
-                   (row["token_hash"], row["answers"]))
+        db.execute("""UPDATE sessions SET legacy_progress=?,delivery=?,delivery_error=?,
+                   sheet_delivery=CASE WHEN ? THEN 'pending' ELSE sheet_delivery END,
+                   sheet_retry_at=CASE WHEN ? THEN '' ELSE sheet_retry_at END
+                   WHERE token_hash=? AND answers=? AND delivery IN ('finish_pending','delivery_failed')""",
+                   (json.dumps(progress, ensure_ascii=False), state, error_code,
+                    complete and rollout, complete and rollout, key, snapshot))
         db.commit()
-        return True
+    logger.info("STRATEGY_DELIVERY legacy_part_confirmed part=%d/%d", index + 1, len(parts))
+    if complete:
+        logger.info("STRATEGY_DELIVERY %s", "legacy_complete" if rollout else "legacy_pilot_api_confirmed_check_order_803481980570")
+    return True
 
 
 def backup_pending_once():
@@ -292,7 +369,7 @@ def start_delivery_worker():
                     WHERE deal_id IS NOT NULL
                     AND delivery IN ('finish_pending','delivery_failed')""").fetchone()[0]
             logger.info("STRATEGY_BACKUP startup configured=%s pending_completed=%d", sheets_configured(), pending)
-            logger.info("STRATEGY_DELIVERY startup v2_configured=%s pending_completed=%d", v2_configured(), gc_pending)
+            logger.info("STRATEGY_DELIVERY startup method=legacy_comment rollout=%s pending_completed=%d", legacy_rollout_enabled(), gc_pending)
         except (OSError, sqlite3.Error) as exc:
             logger.warning("STRATEGY_BACKUP startup_error=%s", type(exc).__name__)
         while True:
@@ -417,6 +494,9 @@ def save_answers():
         if final and row["delivery"] == "finished" and row["answers"] == serialized:
             db.commit()
             return jsonify(ok=True, complete=True)
+        if final and row["answers"] == serialized and row["delivery"] in ("finish_pending", "delivery_failed"):
+            db.commit()
+            return jsonify(ok=True, queued=True)
         state = "finish_pending" if final else "started"
         if not final and row["answers"] == serialized and row["delivery"] == "finished":
             state = "finished"
@@ -427,10 +507,11 @@ def save_answers():
                     delivery_parts=CASE WHEN ? THEN '[]' ELSE delivery_parts END,
                     delivery_index=CASE WHEN ? THEN 0 ELSE delivery_index END,
                     delivery_rejections=CASE WHEN ? THEN 0 ELSE delivery_rejections END,
-                    delivery_error=CASE WHEN ? THEN '' ELSE delivery_error END
+                    delivery_error=CASE WHEN ? THEN '' ELSE delivery_error END,
+                    legacy_progress=CASE WHEN ? THEN '{}' ELSE legacy_progress END
                     WHERE token_hash=?""",
                    (serialized, state, now(), final or changed, final or changed,
-                    changed, changed, changed, changed, key))
+                    changed, changed, changed, changed, changed, key))
         db.commit()
         if final:
             delivery_wakeup.set()
