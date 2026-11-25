@@ -360,23 +360,25 @@ def backup_pending_once():
     return True
 
 
+FRESH_TEST_ORDER = "833386061443"
+
+
 def legacy_short_comment_probe():
-    """One-time diagnostic after the first pilot part was explicitly rejected."""
+    """One test on the fresh completed order; never replay an uncertain request."""
     if legacy_rollout_enabled():
         return False
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
         row = db.execute("""SELECT * FROM sessions WHERE order_number=? AND deal_id IS NOT NULL
-            AND delivery='delivery_failed' AND delivery_error='LEGACY_COMMENT_VALIDATION'""",
-            (LEGACY_PILOT_ORDER,)).fetchone()
+            AND delivery IN ('finish_pending','delivery_failed')""", (FRESH_TEST_ORDER,)).fetchone()
         if not row:
             db.commit()
             return False
         progress = json.loads(row["legacy_progress"])
-        if progress.get("inflight") or progress.get("index") != 0 or not progress.get("offer_retry") or progress.get("offer_short_probe"):
+        if progress.get("inflight") or progress.get("fresh_probe"):
             db.commit()
             return False
-        progress["offer_short_probe"] = "inflight"
+        progress["fresh_probe"] = "inflight"
         db.execute("UPDATE sessions SET legacy_progress=? WHERE token_hash=?",
                    (json.dumps(progress, ensure_ascii=False), row["token_hash"]))
         db.commit()
@@ -386,13 +388,12 @@ def legacy_short_comment_probe():
     except GetCourseError as exc:
         outcome = str(exc)
     with database() as db:
-        progress["offer_short_probe"] = outcome
         db.execute("""UPDATE sessions SET legacy_progress=?
-                   WHERE token_hash=? AND answers=? AND delivery='delivery_failed'
-                   AND delivery_error='LEGACY_COMMENT_VALIDATION'""",
-                   (json.dumps(progress, ensure_ascii=False), row["token_hash"], row["answers"]))
+                   WHERE token_hash=? AND answers=? AND delivery IN ('finish_pending','delivery_failed')""",
+                   (json.dumps({**progress, "fresh_probe":outcome}, ensure_ascii=False),
+                    row["token_hash"], row["answers"]))
         db.commit()
-    logger.info("STRATEGY_DELIVERY legacy_offer_short_probe result=%s order=%s", outcome, LEGACY_PILOT_ORDER)
+    logger.info("STRATEGY_DELIVERY fresh_order_probe result=%s order=%s", outcome, FRESH_TEST_ORDER)
     return True
 
 
@@ -428,7 +429,7 @@ def start_delivery_worker():
                     continue
                 if legacy_short_comment_probe():
                     continue
-                if deliver_pending_once():
+                if legacy_rollout_enabled() and deliver_pending_once():
                     continue
             except (OSError, sqlite3.Error, ValueError) as exc:
                 logger.warning("STRATEGY_DELIVERY worker_error=%s", type(exc).__name__)
