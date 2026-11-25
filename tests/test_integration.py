@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 from backend.app import app
 from backend.getcourse import GetCourseError
-from backend.integration import comment, route, schema, database, digest, order_number, deliver_pending_once, backup_pending_once
+from backend.integration import comment, route, schema, database, digest, order_number, deliver_pending_once, backup_pending_once, legacy_comment_parts
 
 
 class IntegrationTests(unittest.TestCase):
@@ -17,6 +17,7 @@ class IntegrationTests(unittest.TestCase):
             "GETCOURSE_OFFER_ID": "123",
             "GETCOURSE_API_KEY": "fake",
             "GETCOURSE_LIVE": "1",
+            "GETCOURSE_COMMENT_ROLLOUT": "0",
             "GETCOURSE_POLICY_URL": "https://example.invalid/policy",
             "GETCOURSE_CONSENT_URL": "https://example.invalid/consent",
         })
@@ -47,10 +48,10 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(first.status_code, 200)
         self.assertTrue(first.json["queued"])
         self.assertEqual(send.call_count, 1)  # result is available before GetCourse delivery
-        with patch.dict(os.environ, {"GETCOURSE_DEVELOPER_KEY":"dev"}), patch("backend.integration.add_full_order_comment") as add:
+        with patch.dict(os.environ, {"GETCOURSE_COMMENT_ROLLOUT":"1"}), patch("backend.integration.add_legacy_order_comment") as add:
             self.assertTrue(deliver_pending_once())
             self.assertFalse(deliver_pending_once())
-            add.assert_called_once_with("7", comment(self.answers))
+            add.assert_called_once_with(self.person["email"], order_number(digest(self.person)), "7", comment(self.answers))
         self.assertEqual(send.call_count, 1)
         self.assertEqual(self.post("delivery", token=self.token).json["delivery"], "finished")
 
@@ -81,15 +82,39 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(row["deal_id"], "7")
 
     @patch("backend.integration.upsert_order", return_value={"deal_id":7})
-    def test_missing_v2_key_keeps_answers_for_later_delivery(self, send):
+    def test_legacy_pilot_keeps_other_answers_queued_until_approval(self, send):
         self.assertEqual(self.post("start", **self.person).status_code, 200)
         self.assertTrue(self.post("finish", token=self.token, answers=self.answers).json["queued"])
-        self.assertFalse(deliver_pending_once())
-        self.assertEqual(self.post("delivery", token=self.token).json["delivery"], "delivery_failed")
-        self.assertEqual(self.post("resume", token=self.token).json["answers"], self.answers)
-        with patch.dict(os.environ, {"GETCOURSE_DEVELOPER_KEY":"dev"}), patch("backend.integration.add_full_order_comment") as add:
+        with patch("backend.integration.add_legacy_order_comment") as add:
+            self.assertFalse(deliver_pending_once())
+            add.assert_not_called()
+        with database() as db:
+            db.execute("UPDATE sessions SET delivery='delivery_failed',delivery_error='V2_NOT_CONFIGURED'")
+            db.commit()
+        with patch("backend.integration.LEGACY_PILOT_ORDER", order_number(digest(self.person))), patch("backend.integration.add_legacy_order_comment") as add:
             self.assertTrue(deliver_pending_once())
-            add.assert_called_once_with("7", comment(self.answers))
+            self.assertFalse(deliver_pending_once())
+            add.assert_called_once_with(self.person["email"], order_number(digest(self.person)), "7", comment(self.answers))
+            self.assertEqual(self.post("resume", token=self.token).json["answers"], self.answers)
+            with patch.dict(os.environ, {"GETCOURSE_COMMENT_ROLLOUT":"1"}):
+                self.assertFalse(deliver_pending_once())
+            self.assertEqual(add.call_count, 1)
+        self.assertEqual(self.post("delivery", token=self.token).json["delivery"], "finished")
+
+    @patch("backend.integration.upsert_order", return_value={"deal_id":7})
+    def test_legacy_splits_only_explicit_validation_failure(self, send):
+        self.post("start", **self.person)
+        self.post("finish", token=self.token, answers=self.answers)
+        with patch("backend.integration.LEGACY_PILOT_ORDER", order_number(digest(self.person))), patch("backend.integration.add_legacy_order_comment") as add:
+            add.side_effect = [GetCourseError("COMMENT_VALIDATION")] + [None] * 100
+            self.assertTrue(deliver_pending_once())
+            for _ in range(100):
+                if not deliver_pending_once():
+                    break
+            texts = [c.args[3].split("\n", 1)[1] for c in add.call_args_list[1:]]
+            self.assertEqual("".join(texts), comment(self.answers))
+            self.assertTrue(all(len(t.encode("utf-8")) <= 180 for t in texts))
+            self.assertFalse(deliver_pending_once())
 
     @patch("backend.integration.upsert_order", return_value={"deal_id":7})
     def test_sheet_backup_upserts_same_order_and_preserves_saved_answers(self, send):
@@ -106,16 +131,15 @@ class IntegrationTests(unittest.TestCase):
             self.assertIn("Ожидает", status)
             self.assertEqual(self.post("resume", token=self.token).json["answers"], self.answers)
             self.post("finish", token=self.token, answers=self.answers)
-            self.assertTrue(backup_pending_once())
-            self.assertEqual(backup.call_count, 2)
-            self.assertEqual(backup.call_args.args[0]["order_number"], row["order_number"])
+            self.assertFalse(backup_pending_once())
+            self.assertEqual(backup.call_count, 1)
         self.assertEqual(send.call_count, 1)
 
     @patch("backend.integration.upsert_order", return_value={"deal_id":7})
-    def test_v2_failure_stops_retries_without_losing_answers(self, send):
+    def test_legacy_ambiguous_failure_stops_retries_without_losing_answers(self, send):
         self.assertEqual(self.post("start", **self.person).status_code, 200)
         self.assertTrue(self.post("finish", token=self.token, answers=self.answers).json["queued"])
-        with patch.dict(os.environ, {"GETCOURSE_DEVELOPER_KEY":"dev"}), patch("backend.integration.add_full_order_comment", side_effect=GetCourseError("V2_HTTP_403")) as add:
+        with patch("backend.integration.LEGACY_PILOT_ORDER", order_number(digest(self.person))), patch("backend.integration.add_legacy_order_comment", side_effect=GetCourseError("TIMEOUT")) as add:
             self.assertFalse(deliver_pending_once())
             self.assertFalse(deliver_pending_once())
             add.assert_called_once()
