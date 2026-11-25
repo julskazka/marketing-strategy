@@ -527,7 +527,7 @@ def start_delivery_worker():
                     WHERE deal_id IS NOT NULL
                     AND delivery IN ('finish_pending','delivery_failed')""").fetchone()[0]
             logger.info("STRATEGY_BACKUP startup configured=%s pending_completed=%d", sheets_configured(), pending)
-            logger.info("STRATEGY_DELIVERY startup method=flat_direct pending_completed=%d", gc_pending)
+            logger.info("STRATEGY_DELIVERY startup method=paused_duplicate_review pending_completed=%d", gc_pending)
         except (OSError, sqlite3.Error) as exc:
             logger.warning("STRATEGY_BACKUP startup_error=%s", type(exc).__name__)
         while True:
@@ -535,7 +535,8 @@ def start_delivery_worker():
                 reconcile_verified_pilot()
                 # Send directly as soon as finish sets delivery_wakeup.
                 # Keep Sheets independent even when GetCourse rejects a comment.
-                sent = direct_comment_once()
+                # Legacy add can create duplicate orders. Keep the queue intact.
+                sent = False
                 backed_up = backup_pending_once()
                 if sent or backed_up:
                     continue
