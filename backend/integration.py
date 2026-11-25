@@ -363,8 +363,8 @@ def backup_pending_once():
 FRESH_TEST_ORDER = "833386061443"
 
 
-def legacy_short_comment_probe():
-    """One test on the fresh completed order; never replay an uncertain request."""
+def legacy_full_comment_probe():
+    """Send the full questionnaire once, only after the short probe was confirmed."""
     if legacy_rollout_enabled():
         return False
     with database() as db:
@@ -375,25 +375,25 @@ def legacy_short_comment_probe():
             db.commit()
             return False
         progress = json.loads(row["legacy_progress"])
-        if progress.get("inflight") or progress.get("fresh_probe"):
+        if progress.get("inflight") or progress.get("fresh_probe") != "CONFIRMED" or progress.get("fresh_full_probe"):
             db.commit()
             return False
-        progress["fresh_probe"] = "inflight"
+        progress["fresh_full_probe"] = "inflight"
         db.execute("UPDATE sessions SET legacy_progress=? WHERE token_hash=?",
                    (json.dumps(progress, ensure_ascii=False), row["token_hash"]))
         db.commit()
     try:
-        add_legacy_order_comment(row["email"], row["order_number"], row["deal_id"], "Анкета заполнена")
+        add_legacy_order_comment(row["email"], row["order_number"], row["deal_id"], comment(json.loads(row["answers"])))
         outcome = "CONFIRMED"
     except GetCourseError as exc:
         outcome = str(exc)
     with database() as db:
         db.execute("""UPDATE sessions SET legacy_progress=?
                    WHERE token_hash=? AND answers=? AND delivery IN ('finish_pending','delivery_failed')""",
-                   (json.dumps({**progress, "fresh_probe":outcome}, ensure_ascii=False),
+                   (json.dumps({**progress, "fresh_full_probe":outcome}, ensure_ascii=False),
                     row["token_hash"], row["answers"]))
         db.commit()
-    logger.info("STRATEGY_DELIVERY fresh_order_probe result=%s order=%s", outcome, FRESH_TEST_ORDER)
+    logger.info("STRATEGY_DELIVERY fresh_full_probe result=%s order=%s", outcome, FRESH_TEST_ORDER)
     return True
 
 
@@ -427,7 +427,7 @@ def start_delivery_worker():
             try:
                 if backup_pending_once():
                     continue
-                if legacy_short_comment_probe():
+                if legacy_full_comment_probe():
                     continue
                 if legacy_rollout_enabled() and deliver_pending_once():
                     continue
